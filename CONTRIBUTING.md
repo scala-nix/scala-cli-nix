@@ -339,7 +339,7 @@ examples/
   scala-native-docker/            # Wraps the scala-native binary into a dockerTools.buildLayeredImage (Linux-only)
   scala3-jvm-docker/              # Wraps the scala3 JVM app (wrapper + per-artifact JARs end up in the image)
   scala3-native-image-docker/     # Wraps the GraalVM native-image binary
-  hello-http4s-nixos-container/   # NixOS module + VM test that runs hello-http4s.jvm inside a declarative nixos-container (systemd-nspawn)
+  hello-http4s-nixos-container/   # VM test that exercises the http-apps module's `container.enable` path: hello-http4s.jvm inside a declarative nixos-container fronted by caddy
   metals/                         # buildCoursierApp from raw --dep coords (no contrib channel)
   scalafmt/                       # buildCoursierApp via the default coursier app channel
   smithy4s/                       # buildCoursierApp via the coursier contrib channel (--contrib, --scala-binary 2.13.12)
@@ -347,7 +347,7 @@ examples/
 
 Each `*-docker/` example is a thin `dockerTools.buildLayeredImage` derivation that takes the upstream app as a `callPackage` argument; no Scala source or lockfile of its own. They're wired into the root flake under `lib.optionalAttrs pkgs.stdenv.isLinux` (because `dockerTools` doesn't build on Darwin) so they at least build under `nix flake check` on aarch64-linux. The per-image VM tests (`docker-image-scala-native`, `docker-image-scala3-jvm`, `docker-image-scala3-native-image`, each built via the `mkDockerImageTest` helper) are further gated to `x86_64-linux` because `pkgs.testers.runNixOSTest` needs KVM of the matching arch, and that's the only Linux arch we count on for CI builders. Each VM test runs a NixOS guest with dockerd that loads one image and asserts the container's stdout — covering the full pattern from the README's Docker section.
 
-`hello-http4s-nixos-container/` follows the same deployment-example pattern but uses NixOS's native declarative containers instead of Docker. `module.nix` is a reusable NixOS module that declares `containers.hello-http4s` (systemd-nspawn) running `hello-http4s.jvm` and forwarding a host port to the guest. `derivation.nix` builds a `runNixOSTest` VM test that imports the module on a host and curls the forwarded port — gated to `x86_64-linux` for the same KVM-arch reason as the docker tests.
+`hello-http4s-nixos-container/` follows the same deployment-example pattern but uses NixOS's native declarative containers instead of Docker. The shared `hetzner-nixos/modules/http-apps.nix` module gained a per-app `container.enable` option: when set, the unit runs inside `containers.<name>` (systemd-nspawn) on its own auto-allocated `/30` veth pair, with the listen port forwarded to the host so caddy's reverse-proxy line is identical to the host-unit case. `derivation.nix` is a `runNixOSTest` that imports the module, configures one entry with `container.enable = true`, and curls through caddy end-to-end — gated to `x86_64-linux` for the same KVM-arch reason as the docker tests. The same option is exercised in production by `services.http-apps.hello-jvm-container` in `hetzner-nixos/configuration.nix`.
 
 ### Running checks
 

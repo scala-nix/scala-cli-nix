@@ -6,23 +6,11 @@
 }:
 let
   hello-http4s = pkgs.callPackage ../examples/hello-http4s/derivation.nix { };
-
-  # Same hello-http4s.jvm binary as `services.http-apps.hello-jvm`, but
-  # wrapped in a declarative nixos-container (systemd-nspawn). Caddy then
-  # reverse-proxies the forwarded host port. The module is shared with
-  # examples/hello-http4s-nixos-container.
-  hello-jvm-container-port = 8082;
-  hello-jvm-container-module = import ../examples/hello-http4s-nixos-container/module.nix {
-    package = hello-http4s.jvm;
-    hostPort = hello-jvm-container-port;
-    containerPort = 8080;
-  };
 in
 {
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
     ./modules/http-apps.nix
-    hello-jvm-container-module
   ];
 
   services.http-apps = {
@@ -38,14 +26,17 @@ in
       port = 8081;
       environment.PLATFORM = "jvm";
     };
+    # Same JVM binary as `hello-jvm`, but run inside a declarative
+    # nixos-container (systemd-nspawn) instead of directly on the host —
+    # demonstrates the `container.enable` path in http-apps.
+    hello-jvm-container = {
+      package = hello-http4s.jvm;
+      domain = "hello-jvm-container.scala-cli-nix.kubukoz.com";
+      port = 8082;
+      environment.PLATFORM = "jvm";
+      container.enable = true;
+    };
   };
-
-  # Caddy vhost for the containerised JVM app. It only needs the
-  # reverse-proxy line — `services.http-apps` already enables caddy and
-  # opens 80/443.
-  services.caddy.virtualHosts."hello-jvm-container.scala-cli-nix.kubukoz.com".extraConfig = ''
-    reverse_proxy 127.0.0.1:${toString hello-jvm-container-port}
-  '';
 
   # Hetzner cloud cx-series boots in BIOS mode (not UEFI). Disko needs a
   # 1MiB bios_grub partition for GRUB's stage 1.5 to live in on a GPT disk,
