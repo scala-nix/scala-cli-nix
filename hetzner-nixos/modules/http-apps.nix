@@ -6,11 +6,14 @@ let
   appOpts = { name, ... }: {
     options = {
       package = lib.mkOption {
-        type = lib.types.package;
+        type = lib.types.nullOr lib.types.package;
+        default = null;
         description = ''
           Derivation that provides the HTTP server binary. The module invokes
           `lib.getExe`, so the package must set `meta.mainProgram` (every
-          derivation produced by `buildScalaCliApp(s)` does).
+          derivation produced by `buildScalaCliApp(s)` does). Required for the
+          host and `container.enable` deployment modes; ignored when
+          `docker.image` is set.
         '';
       };
 
@@ -47,6 +50,34 @@ let
         default = { };
         description = "Optional nixos-container wrapper for this app.";
       };
+
+      docker = lib.mkOption {
+        type = lib.types.submodule {
+          options.image = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "example-hello-http4s-docker:0.1.0";
+            description = ''
+              OCI image reference (`name:tag`) to run. When set, the app is
+              deployed via `virtualisation.oci-containers` (NixOS-managed
+              docker unit) instead of as a host systemd unit. Mutually
+              exclusive with `container.enable`.
+            '';
+          };
+          options.imageFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.package;
+            default = null;
+            description = ''
+              Locally-built image tarball (e.g. produced by
+              `dockerTools.buildLayeredImage`) loaded into dockerd before the
+              container starts. Use this when the image isn't pushed to a
+              registry the host can pull from.
+            '';
+          };
+        };
+        default = { };
+        description = "Optional docker (oci-containers) deployment for this app.";
+      };
     };
   };
 
@@ -73,26 +104,44 @@ let
     };
   };
 
-  hostApps = lib.filterAttrs (_: app: !app.container.enable) cfg;
+  isDocker = app: app.docker.image != null;
+  isContainer = app: app.container.enable;
+
+  hostApps = lib.filterAttrs (_: app: !isContainer app && !isDocker app) cfg;
+  dockerApps = lib.filterAttrs (_: isDocker) cfg;
 in
 {
   options.services.http-apps = lib.mkOption {
     type = lib.types.attrsOf (lib.types.submodule appOpts);
     default = { };
     description = ''
-      Declarative HTTP applications. Each entry runs as a `DynamicUser` systemd
-      unit bound to a loopback port and is fronted by caddy on the configured
-      domain. Caddy is enabled automatically when at least one app is declared.
+      Declarative HTTP applications. Each entry is exposed via caddy on the
+      configured domain (reverse-proxied to 127.0.0.1:<port>) and runs in one
+      of three modes:
 
-      Setting `container.enable = true` on an entry wraps the unit in a
-      declarative nixos-container instead; the listening port is forwarded
-      from the container to the host so the caddy reverse-proxy line stays
-      identical.
+      - Default: a `DynamicUser` systemd unit on the host running `package`.
+      - `container.enable = true`: the same unit wrapped in a declarative
+        nixos-container (systemd-nspawn) on a private veth pair, with the
+        listen port forwarded to the host.
+      - `docker.image = "name:tag"`: managed by `virtualisation.oci-containers`
+        (NixOS-generated `docker-<name>` unit). Locally-built images can be
+        loaded automatically via `docker.imageFile`.
+
+      Caddy and dockerd are enabled automatically when at least one app needs
+      them.
     '';
   };
 
   config = lib.mkIf (cfg != { }) {
-    # Host-level systemd units for the non-containerised apps.
+    assertions = lib.mapAttrsToList (name: app: {
+      assertion = !(isContainer app && isDocker app);
+      message = "services.http-apps.${name}: container.enable and docker.image are mutually exclusive.";
+    }) cfg ++ lib.mapAttrsToList (name: app: {
+      assertion = isDocker app || app.package != null;
+      message = "services.http-apps.${name}: `package` is required unless `docker.image` is set.";
+    }) cfg;
+
+    # Host-level systemd units for the default deployment mode.
     systemd.services = lib.mapAttrs' (name: app: {
       name = "http-app-${name}";
       value = unitFor name app;
@@ -117,6 +166,21 @@ in
         system.stateVersion = "24.11";
       };
     }) containerApps;
+
+    # Docker deployment via NixOS-managed oci-containers. We bind the
+    # container's port back to 127.0.0.1:<port> so caddy's reverse_proxy
+    # line is identical to the other modes. `imageFile`, when set, makes
+    # the unit `docker load` the tarball before `docker run`.
+    virtualisation.oci-containers.containers = lib.mapAttrs (_name: app: {
+      image = app.docker.image;
+      imageFile = app.docker.imageFile;
+      ports = [ "127.0.0.1:${toString app.port}:${toString app.port}" ];
+      environment = app.environment // { PORT = toString app.port; };
+    }) dockerApps;
+
+    # oci-containers needs a backend; dockerd is the default. Only enable
+    # it if at least one app actually uses docker.
+    virtualisation.docker.enable = lib.mkIf (dockerApps != { }) true;
 
     services.caddy = {
       enable = true;

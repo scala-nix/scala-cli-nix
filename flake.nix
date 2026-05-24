@@ -332,6 +332,9 @@
             example-scala3-native-image-docker = pkgs.callPackage ./examples/scala3-native-image-docker/derivation.nix {
               inherit example-scala3-native-image;
             };
+            example-hello-http4s-docker = pkgs.callPackage ./examples/hello-http4s-docker/derivation.nix {
+              inherit example-hello-http4s;
+            };
             mkDockerImageTest = { name, pkg, expected }: pkgs.testers.runNixOSTest {
               inherit name;
               nodes.machine = { ... }: {
@@ -350,7 +353,8 @@
               '';
             };
           in {
-            inherit example-scala-native-docker example-scala3-jvm-docker example-scala3-native-image-docker;
+            inherit example-scala-native-docker example-scala3-jvm-docker
+              example-scala3-native-image-docker example-hello-http4s-docker;
           } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
             docker-image-scala-native = mkDockerImageTest {
               name = "scala-cli-nix-docker-image-scala-native";
@@ -374,6 +378,32 @@
               pkgs.callPackage ./examples/hello-http4s-nixos-container/derivation.nix {
                 inherit example-hello-http4s;
               };
+            # Docker counterpart of the nixos-container example: loads the
+            # layered image into dockerd, runs it with `-p 8080:8080`, and
+            # curls the exposed port end-to-end.
+            docker-image-hello-http4s = pkgs.testers.runNixOSTest {
+              name = "scala-cli-nix-docker-image-hello-http4s";
+              nodes.machine = { ... }: {
+                virtualisation.docker.enable = true;
+                virtualisation.memorySize = 2048;
+                virtualisation.diskSize = 8192;
+                environment.systemPackages = [ pkgs.curl ];
+              };
+              testScript = ''
+                machine.wait_for_unit("docker.service")
+                machine.succeed("docker load < ${example-hello-http4s-docker}")
+                machine.succeed(
+                  "docker run -d --rm --name app -p 8080:8080 "
+                  "${example-hello-http4s-docker.imageName}:${example-hello-http4s-docker.imageTag}"
+                )
+                machine.wait_until_succeeds(
+                  "curl --fail --silent http://127.0.0.1:8080/ > /tmp/out",
+                  timeout=120,
+                )
+                output = machine.succeed("cat /tmp/out").strip()
+                assert output == "hello from http4s jvm!", f"got {output!r}"
+              '';
+            };
           }
         ) // nixpkgs.lib.listToAttrs (builtins.map
           # 4-target matrix (JVM/Native × Scala 3.3.4/3.6.4). Each target

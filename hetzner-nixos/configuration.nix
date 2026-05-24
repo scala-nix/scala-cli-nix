@@ -6,6 +6,9 @@
 }:
 let
   hello-http4s = pkgs.callPackage ../examples/hello-http4s/derivation.nix { };
+  hello-http4s-docker = pkgs.callPackage ../examples/hello-http4s-docker/derivation.nix {
+    example-hello-http4s = hello-http4s;
+  };
 in
 {
   imports = [
@@ -35,6 +38,15 @@ in
       port = 8082;
       environment.PLATFORM = "jvm";
       container.enable = true;
+    };
+    # Third deployment style: the same JVM binary baked into an OCI image
+    # and managed by `virtualisation.oci-containers` (dockerd).
+    hello-jvm-docker = {
+      domain = "hello-jvm-docker.scala-cli-nix.kubukoz.com";
+      port = 8083;
+      environment.PLATFORM = "jvm";
+      docker.image = "${hello-http4s-docker.imageName}:${hello-http4s-docker.imageTag}";
+      docker.imageFile = hello-http4s-docker;
     };
   };
 
