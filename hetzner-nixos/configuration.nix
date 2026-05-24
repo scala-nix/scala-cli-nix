@@ -79,7 +79,10 @@ in
 
   environment.systemPackages = with pkgs; [
     git
-    vim
+    neovim
+    sysz
+    duf
+    dua
   ];
 
   system.stateVersion = "24.11";
