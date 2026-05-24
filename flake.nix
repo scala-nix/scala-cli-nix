@@ -367,6 +367,13 @@
               pkg = example-scala3-native-image-docker;
               expected = "hello from graalvm native image!";
             };
+            # NixOS-container example: boots a host VM that declares a
+            # `containers.hello-http4s` (systemd-nspawn) running the JVM
+            # hello-http4s app, then curls the forwarded host port.
+            example-hello-http4s-nixos-container =
+              pkgs.callPackage ./examples/hello-http4s-nixos-container/derivation.nix {
+                inherit example-hello-http4s;
+              };
           }
         ) // nixpkgs.lib.listToAttrs (builtins.map
           # 4-target matrix (JVM/Native × Scala 3.3.4/3.6.4). Each target
