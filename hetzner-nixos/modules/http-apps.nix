@@ -178,8 +178,11 @@ in
       environment = app.environment // { PORT = toString app.port; };
     }) dockerApps;
 
-    # oci-containers needs a backend; dockerd is the default. Only enable
-    # it if at least one app actually uses docker.
+    # Pin the oci-containers backend to docker. Recent nixpkgs default
+    # this to podman, which silently changes the generated unit name
+    # (podman-<name>.service) and the runtime — surprising when the
+    # caller wrote `docker.image`. Enable dockerd only when needed.
+    virtualisation.oci-containers.backend = lib.mkIf (dockerApps != { }) "docker";
     virtualisation.docker.enable = lib.mkIf (dockerApps != { }) true;
 
     services.caddy = {

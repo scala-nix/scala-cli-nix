@@ -2,7 +2,7 @@
 
 let
   port = 8080;
-  domain = "hello-jvm-container.test";
+  domain = "hello-native-container.test";
 in
 testers.runNixOSTest {
   name = "scala-cli-nix-hello-http4s-nixos-container";
@@ -10,11 +10,11 @@ testers.runNixOSTest {
   nodes.machine = { ... }: {
     imports = [ ../../hetzner-nixos/modules/http-apps.nix ];
 
-    services.http-apps.hello-jvm-container = {
-      package = example-hello-http4s.jvm;
+    services.http-apps.hello-native-container = {
+      package = example-hello-http4s.native;
       inherit domain;
       inherit port;
-      environment.PLATFORM = "jvm";
+      environment.PLATFORM = "native";
       container.enable = true;
     };
 
@@ -24,20 +24,20 @@ testers.runNixOSTest {
 
     environment.systemPackages = [ curl ];
 
-    # NixOS containers boot a full guest userland; give the host VM
-    # headroom for the JRE running inside.
-    virtualisation.memorySize = 2048;
+    # The native binary is small, but the container still boots a full
+    # NixOS userland — give the host VM modest headroom.
+    virtualisation.memorySize = 1024;
     virtualisation.diskSize = 4096;
   };
 
   testScript = ''
-    machine.wait_for_unit("container@hello-jvm-container.service")
+    machine.wait_for_unit("container@hello-native-container.service")
     machine.wait_for_unit("caddy.service")
     machine.wait_until_succeeds(
       "curl --fail --silent http://${domain}/ > /tmp/out",
       timeout=120,
     )
     output = machine.succeed("cat /tmp/out").strip()
-    assert output == "hello from http4s jvm!", f"got {output!r}"
+    assert output == "hello from http4s native!", f"got {output!r}"
   '';
 }

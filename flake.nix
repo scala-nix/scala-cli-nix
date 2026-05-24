@@ -401,7 +401,7 @@
                   timeout=120,
                 )
                 output = machine.succeed("cat /tmp/out").strip()
-                assert output == "hello from http4s jvm!", f"got {output!r}"
+                assert output == "hello from http4s native!", f"got {output!r}"
               '';
             };
           }

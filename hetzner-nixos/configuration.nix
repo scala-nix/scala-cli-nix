@@ -29,22 +29,22 @@ in
       port = 8081;
       environment.PLATFORM = "jvm";
     };
-    # Same JVM binary as `hello-jvm`, but run inside a declarative
+    # Same native binary as `hello-native`, but run inside a declarative
     # nixos-container (systemd-nspawn) instead of directly on the host —
     # demonstrates the `container.enable` path in http-apps.
-    hello-jvm-container = {
-      package = hello-http4s.jvm;
-      domain = "hello-jvm-container.scala-cli-nix.kubukoz.com";
+    hello-native-container = {
+      package = hello-http4s.native;
+      domain = "hello-native-container.scala-cli-nix.kubukoz.com";
       port = 8082;
-      environment.PLATFORM = "jvm";
+      environment.PLATFORM = "native";
       container.enable = true;
     };
-    # Third deployment style: the same JVM binary baked into an OCI image
+    # Third deployment style: the native binary baked into an OCI image
     # and managed by `virtualisation.oci-containers` (dockerd).
-    hello-jvm-docker = {
-      domain = "hello-jvm-docker.scala-cli-nix.kubukoz.com";
+    hello-native-docker = {
+      domain = "hello-native-docker.scala-cli-nix.kubukoz.com";
       port = 8083;
-      environment.PLATFORM = "jvm";
+      environment.PLATFORM = "native";
       docker.image = "${hello-http4s-docker.imageName}:${hello-http4s-docker.imageTag}";
       docker.imageFile = hello-http4s-docker;
     };
