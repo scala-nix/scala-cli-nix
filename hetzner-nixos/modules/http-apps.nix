@@ -148,18 +148,15 @@ in
     }) hostApps;
 
     # Per-containerised-app: a nixos-container running the same unit
-    # inside the guest. The forwarded port lands on 127.0.0.1:<port>,
-    # which caddy reverse-proxies to identically to the host case.
+    # inside the guest. Caddy reaches the app over the veth pair using
+    # the container's localAddress — no host-port forward needed, which
+    # also sidesteps systemd-nspawn's `--port` iptables rule getting
+    # clobbered by dockerd's nat-table reinstalls.
     containers = lib.mapAttrs (name: app: {
       autoStart = true;
       privateNetwork = true;
       hostAddress = hostAddressFor name;
       localAddress = localAddressFor name;
-      forwardPorts = [{
-        hostPort = app.port;
-        containerPort = app.port;
-        protocol = "tcp";
-      }];
       config = { ... }: {
         systemd.services."http-app-${name}" = unitFor name app;
         networking.firewall.allowedTCPPorts = [ app.port ];
@@ -187,11 +184,16 @@ in
 
     services.caddy = {
       enable = true;
-      virtualHosts = lib.mapAttrs' (_name: app: {
+      virtualHosts = lib.mapAttrs' (name: app: {
         name = app.domain;
-        value.extraConfig = ''
-          reverse_proxy 127.0.0.1:${toString app.port}
-        '';
+        # For containerised apps caddy talks to the guest directly over
+        # the veth pair (localAddress). Host and docker modes both
+        # listen on 127.0.0.1 — docker via `-p 127.0.0.1:<port>:<port>`.
+        value.extraConfig =
+          let upstream = if isContainer app then localAddressFor name else "127.0.0.1";
+          in ''
+            reverse_proxy ${upstream}:${toString app.port}
+          '';
       }) cfg;
     };
 
