@@ -409,16 +409,22 @@
           # 4-target matrix (JVM/Native × Scala 3.3.4/3.6.4). Each target
           # produces its own derivation (keyed `<platform>-<version>` per
           # lib.nix's nixKey), so building all four exercises the
-          # platform×version key-naming path. The binaries print a single
-          # shared greeting — distinguishability comes from the derivation
-          # keys, not the output.
+          # platform×version key-naming path. The project also carries
+          # platform-specific sources (`Platform.{jvm,native}.scala`, scoped
+          # via `//> using target.platform`), so the greeting names its
+          # platform — this verifies the lock step unions sources across all
+          # targets (not just the first), letting every target's Nix sandbox
+          # see its own platform variant.
           (key: {
             name = "example-scala3-cross-platform-version-${key}";
             value = mkOutputCheck {
               name = "example-scala3-cross-platform-version-${key}";
               pkg = example-scala3-cross-platform-version."${key}";
               binName = "example-scala3-cross-platform-version";
-              expected = "hello from cross-platform-version!";
+              expected =
+                if nixpkgs.lib.hasPrefix "native-" key
+                then "hello from cross-platform-version on native!"
+                else "hello from cross-platform-version on jvm!";
             };
           })
           [ "jvm-3_3_4" "jvm-3_6_4" "native-3_3_4" "native-3_6_4" ])

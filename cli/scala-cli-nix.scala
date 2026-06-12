@@ -116,7 +116,9 @@ object ExportScope {
       sources <- c.get[List[String]]("sources")
       resourceDirs <- c.getOrElse[List[String]]("resourceDirs")(Nil)
       deps <- c.getOrElse[List[ExportDependency]]("dependencies")(Nil)
-      injected <- c.getOrElse[List[ExportDependency]]("injectedDependencies")(Nil)
+      injected <- c.getOrElse[List[ExportDependency]]("injectedDependencies")(
+        Nil
+      )
       resolvers <- c.getOrElse[List[String]]("resolvers")(Nil)
     } yield ExportScope(sources, resourceDirs, deps, injected, resolvers)
   }
@@ -946,7 +948,9 @@ val lockfilePrinter: Printer =
 
 /** Compute lockfile content without writing it. Always recomputes from scratch.
   */
-def computeLock(inputs: List[String], sourceRoot: Option[Path])(using HashCache): IO[String] = {
+def computeLock(inputs: List[String], sourceRoot: Option[Path])(using
+    HashCache
+): IO[String] = {
   // When `--src` is set, relative positional args (e.g. specific files to lock)
   // are resolved under the source root rather than cwd, so that
   // `scn lock --src /nix/store/xxx foo.scala` locks `xxx/foo.scala`. With no
@@ -954,7 +958,7 @@ def computeLock(inputs: List[String], sourceRoot: Option[Path])(using HashCache)
   // is unchanged: positionals stay verbatim, or default to ".".
   val inputArgs = sourceRoot match {
     case Some(root) if inputs.isEmpty => List(root.toString)
-    case Some(root) =>
+    case Some(root)                   =>
       inputs.map { i =>
         val p = Path(i)
         if (p.isAbsolute) i else (root / p).toString
@@ -973,32 +977,49 @@ def computeLock(inputs: List[String], sourceRoot: Option[Path])(using HashCache)
       s"Targets: ${C.bold}${targets.map(t => targetKey(t, targets)).mkString(", ")}${C.reset}"
     )
 
-    // Read sources once from any target's export (they're shared across targets, at least for now that's the assumption)
+    // Top-level sources/resourceDirs are the UNION across every target's
+    // export. A cross project can scope a source to one platform with a
+    // `//> using target.platform <jvm|scala-native>` directive, so each
+    // target's export lists a different set of files. Reading only one
+    // target's export would silently drop the others' platform-scoped
+    // sources and break those targets' Nix builds (the sandbox filters the
+    // source tree by this list). Listing every target's sources here is safe:
+    // the directive — not the filename — gates which files each platform
+    // compiles, so a file scoped to another platform is simply ignored.
     _ <- step("Discovering sources...")
-    firstTarget = targets.head
-    firstExportJson <- exec(
-      scalaCli,
-      ("--power" :: "export" :: "--json" :: "--server=false" ::
-        "--platform" :: firstTarget.platformFlag ::
-        firstTarget.scalaVersion.toList
-          .flatMap(v => List("--scala-version", v)) ++
-        inputArgs)*
-    )
-    firstExport <- IO.fromEither(
-      parseJson(firstExportJson)
-        .flatMap(_.as[ExportInfo])
-        .leftMap(e =>
-          new RuntimeException(s"Failed to parse export JSON: ${e.getMessage}")
+    perTargetScopes <- targets.traverse { target =>
+      val versionArgs =
+        target.scalaVersion.toList.flatMap(v => List("--scala-version", v))
+      for {
+        exportJson <- exec(
+          scalaCli,
+          ("--power" :: "export" :: "--json" :: "--server=false" ::
+            "--platform" :: target.platformFlag :: versionArgs ++ inputArgs)*
         )
-    )
-    firstMainScope = firstExport.scopes
-      .getOrElse("main", ExportScope(Nil, Nil, Nil, Nil, Nil))
-    sources = firstMainScope.sources.map(stripBase(basePath))
-    resourceDirs = firstMainScope.resourceDirs.map(stripBase(basePath))
+        export_ <- IO.fromEither(
+          parseJson(exportJson)
+            .flatMap(_.as[ExportInfo])
+            .leftMap(e =>
+              new RuntimeException(
+                s"Failed to parse export JSON: ${e.getMessage}"
+              )
+            )
+        )
+      } yield export_.scopes
+        .getOrElse("main", ExportScope(Nil, Nil, Nil, Nil, Nil))
+    }
+    sources = perTargetScopes
+      .flatMap(_.sources.map(stripBase(basePath)))
+      .distinct
+    resourceDirs = perTargetScopes
+      .flatMap(_.resourceDirs.map(stripBase(basePath)))
+      .distinct
 
     targetLocks <- targets.traverse { target =>
       val key = targetKey(target, targets)
-      computeTargetLock(scalaCli, inputArgs, basePath, target, key).map(key -> _)
+      computeTargetLock(scalaCli, inputArgs, basePath, target, key).map(
+        key -> _
+      )
     }
 
     lockFile = LockFile(
@@ -1108,7 +1129,8 @@ private def computeTargetLockContent(
       // dep (e.g. munit 1.3.0 pulling javalib_native 0.5.11 while the main
       // scope pins 0.5.10).
       val mainInjected = toDeps(mainScope.injectedDependencies)
-      val testInjected = testScope.map(s => toDeps(s.injectedDependencies)).getOrElse(Nil)
+      val testInjected =
+        testScope.map(s => toDeps(s.injectedDependencies)).getOrElse(Nil)
 
       for {
         _ <- info(s"Scala version: ${C.bold}$scalaVersion${C.reset}")
@@ -1221,24 +1243,25 @@ def withHashCache[A](body: HashCache ?=> IO[A]): IO[A] =
     }
   } yield result
 
-def lock(inputs: List[String], sourceRoot: Option[String]): IO[ExitCode] = withHashCache {
-  for {
-    resolvedRoot <- sourceRoot.traverse(absolutePath)
-    content <- computeLock(inputs, resolvedRoot)
-    cwd <- Files[IO].currentWorkingDirectory
-    lockfilePath = cwd / "scala.lock.json"
-    existingContent <- Files[IO]
-      .exists(lockfilePath)
-      .ifM(readFile(lockfilePath), IO.pure(""))
-    _ <-
-      if (existingContent == content)
-        info("Lock is up to date.")
-      else
-        step("Writing lockfile...") *>
-          writeFile(lockfilePath, content) *>
-          success(s"Wrote ${C.bold}scala.lock.json${C.reset}")
-  } yield ExitCode.Success
-}
+def lock(inputs: List[String], sourceRoot: Option[String]): IO[ExitCode] =
+  withHashCache {
+    for {
+      resolvedRoot <- sourceRoot.traverse(absolutePath)
+      content <- computeLock(inputs, resolvedRoot)
+      cwd <- Files[IO].currentWorkingDirectory
+      lockfilePath = cwd / "scala.lock.json"
+      existingContent <- Files[IO]
+        .exists(lockfilePath)
+        .ifM(readFile(lockfilePath), IO.pure(""))
+      _ <-
+        if (existingContent == content)
+          info("Lock is up to date.")
+        else
+          step("Writing lockfile...") *>
+            writeFile(lockfilePath, content) *>
+            success(s"Wrote ${C.bold}scala.lock.json${C.reset}")
+    } yield ExitCode.Success
+  }
 
 // --- Init command ---
 
@@ -1273,7 +1296,8 @@ def init(
         inputs match {
           case singleUrl :: Nil if looksLikeGitHubUrl(singleUrl) =>
             IO.fromEither(
-              parseGitHubUrl(singleUrl).leftMap(msg => new RuntimeException(msg))
+              parseGitHubUrl(singleUrl)
+                .leftMap(msg => new RuntimeException(msg))
             ).flatMap(doInitFromGitHub(cwd, _, ref))
           case _ if inputs.nonEmpty =>
             doInit(cwd, inputs, ref)
@@ -1295,7 +1319,9 @@ def init(
 
 private def looksLikeGitHubUrl(s: String): Boolean = {
   val lower = s.toLowerCase
-  lower.startsWith("https://github.com/") || lower.startsWith("http://github.com/")
+  lower.startsWith("https://github.com/") || lower.startsWith(
+    "http://github.com/"
+  )
 }
 
 private def doInit(
@@ -1548,7 +1574,9 @@ private def doInitFromGitHub(
     _ <- writeFile(lockPath, lockContent)
 
     _ <- errln("")
-    _ <- success(s"Wrote ${C.bold}derivation.nix${C.reset} and ${C.bold}scala.lock.json${C.reset}.")
+    _ <- success(
+      s"Wrote ${C.bold}derivation.nix${C.reset} and ${C.bold}scala.lock.json${C.reset}."
+    )
     _ <-
       if (isNative) errln("") *> printNativeHint()
       else IO.unit
@@ -1556,10 +1584,10 @@ private def doInitFromGitHub(
 }
 
 /** Render the external-build `derivation.nix`. Single-target shape: the
-  * `target =` arg of `buildScalaCliApp` is omitted because we expect one
-  * target per external build (multi-target projects can switch to
-  * `buildScalaCliApps`, but that's a manual edit and rare for upstreams that
-  * don't already package themselves).
+  * `target =` arg of `buildScalaCliApp` is omitted because we expect one target
+  * per external build (multi-target projects can switch to `buildScalaCliApps`,
+  * but that's a manual edit and rare for upstreams that don't already package
+  * themselves).
   */
 def renderGitHubDerivation(
     pname: String,
@@ -1613,9 +1641,10 @@ def renderGitHubDerivation(
      |""".stripMargin
 }
 
-/** Check whether any .scala file at `src` carries `//> using computeVersion git:dynver`,
-  * and if so produce a writable copy with the directive stripped. Returns the
-  * original path unchanged when no patch is needed.
+/** Check whether any .scala file at `src` carries
+  * `//> using computeVersion git:dynver`, and if so produce a writable copy
+  * with the directive stripped. Returns the original path unchanged when no
+  * patch is needed.
   *
   * We use `find -exec grep -l ...` to detect, then `cp -r` + `sed -i` to patch.
   * The temp dir is created under `$TMPDIR`; we leave it on disk because the
@@ -1628,7 +1657,11 @@ def sanitizeSrcForDynver(src: Path): IO[Path] = {
     hits <- exec(
       "sh",
       "-c",
-      s"""find ${shellEscape(src.toString)} -name '*.scala' -exec grep -l -F ${shellEscape(dynverPattern)} {} + || true"""
+      s"""find ${shellEscape(
+          src.toString
+        )} -name '*.scala' -exec grep -l -F ${shellEscape(
+          dynverPattern
+        )} {} + || true"""
     )
     needsPatch = hits.trim.nonEmpty
     result <-
@@ -1645,7 +1678,11 @@ def sanitizeSrcForDynver(src: Path): IO[Path] = {
           _ <- exec(
             "sh",
             "-c",
-            s"""find ${shellEscape(dest.toString)} -name '*.scala' -exec sed -i.bak '/^\\/\\/> using computeVersion git:dynver$$/d' {} + && find ${shellEscape(dest.toString)} -name '*.bak' -delete"""
+            s"""find ${shellEscape(
+                dest.toString
+              )} -name '*.scala' -exec sed -i.bak '/^\\/\\/> using computeVersion git:dynver$$/d' {} + && find ${shellEscape(
+                dest.toString
+              )} -name '*.bak' -delete"""
           )
         } yield dest
       }
@@ -1677,8 +1714,8 @@ private def printNativeHint(): IO[Unit] =
 // --- GitHub URL handling (for `init <url>`) ---
 
 /** A GitHub repo reference parsed from a browser URL:
-  *   - `https://github.com/<owner>/<repo>`              → ref = None
-  *   - `https://github.com/<owner>/<repo>/tree/<ref>`   → ref = Some(<ref>)
+  *   - `https://github.com/<owner>/<repo>` → ref = None
+  *   - `https://github.com/<owner>/<repo>/tree/<ref>` → ref = Some(<ref>)
   * `<ref>` is anything: a branch, a tag, a commit sha. We resolve it to a
   * concrete sha later (see `resolveRev`).
   */
@@ -1686,10 +1723,15 @@ case class GitHubRepo(owner: String, repo: String, ref: Option[String])
 
 case class ResolvedRepo(owner: String, repo: String, rev: String) {
   def shortRev: String = rev.take(7)
-  def archiveUrl: String = s"https://github.com/$owner/$repo/archive/$rev.tar.gz"
+  def archiveUrl: String =
+    s"https://github.com/$owner/$repo/archive/$rev.tar.gz"
 }
 
-case class FetchedRepo(resolved: ResolvedRepo, sha256Sri: String, storePath: Path)
+case class FetchedRepo(
+    resolved: ResolvedRepo,
+    sha256Sri: String,
+    storePath: Path
+)
 
 /** Parse a GitHub web URL into owner/repo/ref. Trailing `.git` is tolerated;
   * anything past `/tree/<ref>` (e.g. `/tree/main/path/inside`) is rejected
@@ -1749,7 +1791,7 @@ private def githubApiGet(
     resp.bodyText.compile.string.flatMap { body =>
       resp.status match {
         case Status.Ok => IO.pure(body)
-        case sc =>
+        case sc        =>
           IO.raiseError(
             new RuntimeException(
               s"GitHub API GET $path failed: HTTP ${sc.code} ${sc.reason}\n$body"
@@ -1760,10 +1802,10 @@ private def githubApiGet(
   }
 }
 
-/** Resolve a ref to a commit sha. If `ref` is already a 40-char hex sha,
-  * skip the API call. Otherwise GET /repos/:owner/:repo/commits/:ref —
-  * GitHub returns the resolved commit (and follows branches & tags). When
-  * `ref` is None we resolve the repo's default branch via the repo metadata.
+/** Resolve a ref to a commit sha. If `ref` is already a 40-char hex sha, skip
+  * the API call. Otherwise GET /repos/:owner/:repo/commits/:ref — GitHub
+  * returns the resolved commit (and follows branches & tags). When `ref` is
+  * None we resolve the repo's default branch via the repo metadata.
   */
 def resolveRev(
     repo: GitHubRepo
@@ -1774,7 +1816,7 @@ def resolveRev(
     case refOpt =>
       val refToResolve = refOpt match {
         case Some(r) => IO.pure(r)
-        case None =>
+        case None    =>
           githubApiGet(s"/repos/${repo.owner}/${repo.repo}").flatMap { body =>
             IO.fromEither(
               parseJson(body)
@@ -1809,8 +1851,8 @@ def resolveRev(
   * pre-release suffixes are ignored to keep the comparison simple.
   *
   * The reachability check uses `/compare/<tag>...<rev>`: if GitHub reports
-  * `status == "ahead"` or `"identical"`, the tag is an ancestor. `behind`
-  * means the tag is on a divergent branch; `diverged` means both.
+  * `status == "ahead"` or `"identical"`, the tag is an ancestor. `behind` means
+  * the tag is on a divergent branch; `diverged` means both.
   */
 case class TagInfo(name: String, sha: String, semver: (Int, Int, Int))
 
@@ -1859,24 +1901,27 @@ def compareCommits(
 )(using Client[IO]): IO[CompareResult] =
   githubApiGet(s"/repos/$owner/$repo/compare/$base...$head").flatMap { body =>
     IO.fromEither(
-      parseJson(body).flatMap { json =>
-        val c = json.hcursor
-        for {
-          status <- c.downField("status").as[String]
-          ahead <- c.downField("ahead_by").as[Int]
-        } yield CompareResult(status, ahead)
-      }.leftMap(e =>
-        new RuntimeException(
-          s"Failed to parse compare JSON: ${e.getMessage}"
+      parseJson(body)
+        .flatMap { json =>
+          val c = json.hcursor
+          for {
+            status <- c.downField("status").as[String]
+            ahead <- c.downField("ahead_by").as[Int]
+          } yield CompareResult(status, ahead)
+        }
+        .leftMap(e =>
+          new RuntimeException(
+            s"Failed to parse compare JSON: ${e.getMessage}"
+          )
         )
-      )
     )
   }
 
-/** Format a dynver-style version string. `<latest-reachable-tag>-<ahead>-<short-sha>`
-  * when a tag is reachable from `rev` and we're at least one commit ahead;
-  * the plain tag (no suffix) when `rev` *is* the tag; `0-unstable-<short-sha>`
-  * when no semver tag is reachable.
+/** Format a dynver-style version string.
+  * `<latest-reachable-tag>-<ahead>-<short-sha>` when a tag is reachable from
+  * `rev` and we're at least one commit ahead; the plain tag (no suffix) when
+  * `rev` *is* the tag; `0-unstable-<short-sha>` when no semver tag is
+  * reachable.
   */
 def computeVersion(
     resolved: ResolvedRepo
@@ -1886,10 +1931,13 @@ def computeVersion(
     // Walk tags newest-semver first; the first one we find that is an ancestor
     // (status == ahead | identical) wins. This avoids comparing every tag when
     // the repo's latest is the most likely match.
-    val candidates = tags.sortBy(_.semver)(using Ordering[(Int, Int, Int)].reverse)
-    def firstAncestor(remaining: List[TagInfo]): IO[Option[(TagInfo, CompareResult)]] =
+    val candidates =
+      tags.sortBy(_.semver)(using Ordering[(Int, Int, Int)].reverse)
+    def firstAncestor(
+        remaining: List[TagInfo]
+    ): IO[Option[(TagInfo, CompareResult)]] =
       remaining match {
-        case Nil => IO.pure(None)
+        case Nil       => IO.pure(None)
         case t :: rest =>
           compareCommits(resolved.owner, resolved.repo, t.sha, resolved.rev)
             .flatMap {
@@ -1900,7 +1948,7 @@ def computeVersion(
             }
       }
     firstAncestor(candidates).map {
-      case None => fallback
+      case None                                       => fallback
       case Some((tag, CompareResult("identical", _))) =>
         tag.name.stripPrefix("v")
       case Some((tag, CompareResult(_, ahead))) =>

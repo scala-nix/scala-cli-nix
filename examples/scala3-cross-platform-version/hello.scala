@@ -3,6 +3,6 @@
 
 object Main {
   def main(args: Array[String]): Unit = {
-    println("hello from cross-platform-version!")
+    println(s"hello from cross-platform-version on ${Platform.name}!")
   }
 }

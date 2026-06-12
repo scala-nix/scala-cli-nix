@@ -2,7 +2,9 @@
   "resourceDirs": [
   ],
   "sources": [
-    "hello.scala"
+    "Platform.jvm.scala",
+    "hello.scala",
+    "Platform.native.scala"
   ],
   "targets": {
     "jvm-3.3.4": {
@@ -436,7 +438,7 @@
           "url": "https://repo1.maven.org/maven2/org/scalatest/scalatest_2.12/3.2.16/scalatest_2.12-3.2.16.pom"
         }
       ],
-      "exportHash": "acc550902ccf44dbe1c508230b56de0b5a925c76",
+      "exportHash": "98f22623e9d3d9ab7d8ead6532bb9fae424fa18d",
       "libraryDependencies": [
         {
           "sha256": "l4RavkKm7B1yNEapz+A1VlRCYZyvugN0EXpUltNlHok=",
@@ -917,7 +919,7 @@
           "url": "https://repo1.maven.org/maven2/org/scalatest/scalatest_2.12/3.2.19/scalatest_2.12-3.2.19.pom"
         }
       ],
-      "exportHash": "59089dec89a15d05d33bc97fc8d7a3bb9cb5dc70",
+      "exportHash": "3f58548ee2c8c9c1dbe453113b64e2f190952feb",
       "libraryDependencies": [
         {
           "sha256": "l4RavkKm7B1yNEapz+A1VlRCYZyvugN0EXpUltNlHok=",
@@ -1406,7 +1408,7 @@
           "url": "https://repo1.maven.org/maven2/org/scalatest/scalatest_2.12/3.2.16/scalatest_2.12-3.2.16.pom"
         }
       ],
-      "exportHash": "fdf92bd14049b84771670b80efbaf407ff2d9b63",
+      "exportHash": "fc5bbdf5ddeb4e2c7b71ece8962476807d95c9d8",
       "libraryDependencies": [
         {
           "sha256": "FWneZDfXHoeIBzAvjhsGoGti0hfNSjDoAZyVQ9ZoPf8=",
@@ -2652,7 +2654,7 @@
           "url": "https://repo1.maven.org/maven2/org/scalatest/scalatest_2.12/3.2.19/scalatest_2.12-3.2.19.pom"
         }
       ],
-      "exportHash": "3cfbbff87e098349e98a70c4dbc73dabc0549112",
+      "exportHash": "ebb1e26def34a2bc8a5af55081ee60d32372b630",
       "libraryDependencies": [
         {
           "sha256": "FWneZDfXHoeIBzAvjhsGoGti0hfNSjDoAZyVQ9ZoPf8=",
