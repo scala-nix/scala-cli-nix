@@ -2,6 +2,7 @@
   modulesPath,
   lib,
   pkgs,
+  smithy-exercises,
   ...
 }:
 let
@@ -9,12 +10,24 @@ let
   hello-http4s-docker = pkgs.callPackage ../examples/hello-http4s-docker/derivation.nix {
     example-hello-http4s = hello-http4s;
   };
+  smithyPkgs = smithy-exercises.packages.${pkgs.system};
 in
 {
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
     ./modules/http-apps.nix
+    # The smithy-exercises teaching site: a dedicated Caddy vhost serving the
+    # static Astro build + reverse-proxying /api to the validator container.
+    smithy-exercises.nixosModules.default
   ];
+
+  # smithy-exercises teaching site on its own subdomain.
+  services.smithy-exercises = {
+    enable = true;
+    domain = "smithy.scala-cli-nix.kubukoz.com";
+    site = smithyPkgs.smithy-exercises-site;
+    validatorPackage = smithyPkgs.smithy-exercises-validator;
+  };
 
   services.http-apps = {
     hello-native = {

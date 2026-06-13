@@ -5,9 +5,15 @@
     disko.inputs.nixpkgs.follows = "nixpkgs";
     deploy-rs.url = "github:serokell/deploy-rs";
     deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
+
+    # The smithy-exercises teaching site (ships the NixOS module + the site /
+    # validator packages; server01 imports it below). Its nixpkgs follows this
+    # flake so the whole closure resolves through a single nixpkgs.
+    smithy-exercises.url = "git+file:///Users/kubukoz/projects/smithy-exercises";
+    smithy-exercises.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, disko, deploy-rs, ... }:
+  outputs = { self, nixpkgs, disko, deploy-rs, smithy-exercises, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
     in {
@@ -15,6 +21,9 @@
 
       nixosConfigurations.server01 = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
+        # Expose the smithy-exercises flake to configuration.nix (for its
+        # nixosModule + the site/validator packages it ships).
+        specialArgs = { inherit smithy-exercises; };
         modules = [
           disko.nixosModules.disko
           # Make `pkgs.scala-cli-nix` available in configuration.nix so it can
