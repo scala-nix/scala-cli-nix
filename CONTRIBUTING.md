@@ -122,11 +122,12 @@ Target keys use only the dimensions that vary:
 - `sources` — top-level, shared across targets. Lists source files relative to the project root.
 - `resourceDirs` — top-level, shared across targets. Resource directories declared via `//> using resourceDir` (or equivalent CLI options), as paths relative to the project root. The build pulls each directory into the filtered source tree as a whole subtree so `scala-cli package` embeds its contents into the JAR (JVM) or the linked binary (Native).
 - `targets.<key>.exportHash` — SHA-1 hex digest of the canonicalized (sorted keys, no spaces) `scala-cli export --json` output for this target, followed by a newline. Used for per-target staleness detection.
-- `targets.<key>.platform` — `"JVM"` or `"Native"`. Determines the build strategy.
+- `targets.<key>.platform` — `"JVM"`, `"Native"`, or `"JS"`. Determines the build strategy.
 - `targets.<key>.compiler` / `libraryDependencies` — JARs, their POMs, and parent POMs. Parent POMs are needed because Coursier resolves version inheritance from parent POMs during offline resolution. The lock command walks each resolved POM's declared deps and materializes their POMs too (so scala-cli's offline resolver can see the full dep graph), but it does **not** materialize a JAR for any `(group, artifact)` already covered by the main resolution winner — an extra JAR at a different version on the runtime classpath would shadow the winner's classes (NoSuchMethodError at runtime).
 - `targets.<key>.native` — present for Scala Native targets. Carries `scalaNativeVersion` and `toolingDependencies` (the linker, scala-native-cli, etc.). Tooling is resolved on its own because it targets Scala 2.12 while everything else uses the project's Scala version. Scala Native's own runtime deps (`nscplugin`, `scala3lib_native`, `javalib_native`) come from the export's per-scope `injectedDependencies` and are folded into `libraryDependencies` and `test.libraryDependencies` via the combined resolution — see the next bullet.
 - **Combined resolution for Native targets.** scala-cli, at build time, resolves user deps and its injected native runtime deps together in one Coursier pass. The lock command must do the same: if user libs are resolved separately, a different version can "win" for a transitively-shared module than the version scala-cli picks at build time, and `scala-cli package --offline` fails to find the JAR for its winner. Concretely: `portable-scala-reflect_native0.5_2.13:1.1.3` (transitively pulled by e.g. `scala-java-time`) declares `scalalib_native0.5_2.13:2.13.8+0.5.2` directly. In a user-libs-only resolution, an older transitive `scala3lib_native` pulls a higher `scalalib_native0.5_2.13` and wins. With scala-cli's latest `scala3lib_native` added as a direct dep, it excludes `scalalib_native0.5_2.13` from its chain — the only remaining path is portable-scala-reflect's pinned 2.13.8+0.5.2, which becomes the winner. The lock-time CLI mirrors this by handing the fork's `injectedDependencies` (which include `scala3lib_native`/`javalib_native`/`nscplugin`) to Coursier alongside the user's deps. Regression test: `examples/scala3-native-evicted-2.13`.
-- `targets.<key>.test` — optional. Present when the project has test sources or test-only deps. Contains `sources` (test source files), `resourceDirs` (test-scope resource directories, merged with the top-level `resourceDirs` when running tests), and `libraryDependencies` (full main+test classpath; reuses the target's `compiler` and `native` blocks).
+- `targets.<key>.js` — present for Scala.js targets. Carries `scalaJsVersion`, `scalaJsCliVersion`, and `toolingDependencies` (the Scala.js linker: `org.virtuslab.scala-cli:scalajscli_2.13` and its transitive closure, including the closure-compiler). The linker is resolved with `scalajs-linker_2.13` forced to `scalaJsVersion` (mirrors scala-cli's own `ScalaJsLinker.linkerCommand`), so the locked linker links the same way a real `scala-cli package --js` run would. Unlike Native, the JS standard library (`scala3-library_sjs1_3:<scalaVersion>` for Scala 3) is **not** reported in the export's `injectedDependencies`, so the lock command adds it as a direct lib dep itself; without it `scala-cli package --offline` can't find the JS stdlib in the cache. The Scala.js runtime (`scalajs-library_2.13`) does come through `injectedDependencies`.
+- `targets.<key>.test` — optional. Present when the project has test sources or test-only deps. Contains `sources` (test source files), `resourceDirs` (test-scope resource directories, merged with the top-level `resourceDirs` when running tests), and `libraryDependencies` (full main+test classpath; reuses the target's `compiler`, `native`, and `js` blocks).
 
 #### Coursier cache path structure
 
@@ -203,14 +204,24 @@ For Scala Native (`platform: "Native"`), the build is simpler but the dependency
 3. **No wrapper**: The output is a native binary, copied directly to `$out/bin`. No JVM or classpath needed at runtime.
 4. **Extra build inputs**: `clang` and `which` are needed for the native linking step.
 
+#### Scala.js builds (frontend)
+
+For Scala.js (`platform: "JS"`), the build links the app into a single ES-module JS file. This targets the frontend-only flow (no node) — the output is meant to be bundled downstream (e.g. by vite), mirroring `scala-cli package --js -o main.js` outside Nix.
+
+1. **Deps cache**: Compiler + library JARs/POMs plus the JS linker tooling (`js.toolingDependencies`) are symlinked into the Coursier cache. The library set already includes the JS stdlib (`scala3-library_sjs1_3`), the JS runtime (`scalajs-library_2.13`), and user deps — see the `targets.<key>.js` field reference.
+2. **Linking on the JVM**: `scala-cli --power package <sources> --server=false --offline --platform scala-js --js-version <v> --js-cli-version <v> --js-cli-on-jvm --scala-version <v> -o $out/share/<pname>.js`. `--js-cli-on-jvm` forces the Scala.js linker to run as JARs from the offline cache (the default would download a per-OS `scala-js-ld` binary from GitHub, which the sandbox can't reach). `--js-cli-version` pins the linker version exactly.
+3. **No wrapper, no node**: The output is just `$out/share/<pname>.js`. There is no `$out/bin` and no node runtime.
+4. **Why the fork is used in-sandbox for JS only.** Unlike JVM/Native (which build with upstream `prev.scala-cli`), the JS path builds with the bundled kubukoz/scala-cli fork (`scalaCliJs` in `lib.nix`, wired in the overlay). Upstream's linker resolves the Scala.js CLI as a `<v>+` range, which needs version-listing metadata that the offline sandbox cache doesn't carry; the fork pins it exactly when `--js-cli-version` is passed. `clang`/native tooling are **not** needed — linking is pure JVM.
+
 #### Common key flags
 
 - `--library` (JVM, default `packaging = "app"`): produces a tiny JAR with only user code. `--standalone` would bundle all deps into one fat JAR, defeating per-artifact store granularity. The opt-in `packaging = "assembly"` mode uses `--assembly` instead, producing a fat JAR for distribution (tradeoff documented above).
 - `--server=false`: disables Bloop compilation server (can't run in sandbox).
 - `--offline`: prevents any network access attempts.
 - `--power`: required to use `--library`.
-- `--platform jvm|scala-native`: selects the target platform. Always passed, even for single-target projects.
+- `--platform jvm|scala-native|scala-js`: selects the target platform. Always passed, even for single-target projects.
 - `--scala-version <v>`: pins the Scala version. Always passed.
+- `--js-version <v> --js-cli-version <v> --js-cli-on-jvm` (JS only): pin the Scala.js version and linker version, and run the linker on the JVM from the offline cache. See "Scala.js builds" above.
 
 Sandbox environment variables set in the derivation:
 - `COURSIER_CACHE` → the symlinked cache dir
@@ -325,6 +336,7 @@ examples/
   scala-native-ce/     # Scala Native + cats-effect example
   scala-native-ce-cross/  # Cross JVM+Native example (cats-effect)
   scala-resources/        # Cross JVM+Native example using //> using resourceDir
+  scala3-js/              # Scala.js (frontend) example: links to $out/share/<pname>.js, no node
   scala3-native-image/    # JVM target built as a GraalVM native image (nativeImage = true)
   scala3-assembly/        # JVM target built as a fat assembly JAR (packaging = "assembly")
   scala3-shadowed-deps/   # Regression guard: builds against a real lockfile that includes an evicted-POM coordinate; the binary calls `Node.child` to verify the runtime classpath isn't shadowed by a duplicate JAR

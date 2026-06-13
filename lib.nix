@@ -1,4 +1,11 @@
-{ scala-cli, openjdk, makeWrapper, runCommand, stdenv, lib, clang, which, graalvmPackages, fetchurl, bash }:
+# `scalaCliJs` is the scala-cli used *inside the sandbox for Scala.js builds*.
+# It defaults to the same `scala-cli` as every other platform, but the overlay
+# passes the bundled kubukoz/scala-cli fork: the JS linker needs the fork's
+# "pin the Scala.js CLI version exactly instead of as a `<v>+` range" fix so it
+# resolves offline (upstream still uses a range, which needs version-listing
+# metadata the sandbox cache doesn't carry). JVM/Native builds keep using the
+# unmodified upstream `scala-cli`.
+{ scala-cli, scalaCliJs ? scala-cli, openjdk, makeWrapper, runCommand, stdenv, lib, clang, which, graalvmPackages, fetchurl, bash }:
 let
   supportedVersion = 9;
 
@@ -24,6 +31,7 @@ let
         then builtins.throw "scala-cli-nix: buildScalaCliApp(s) expects a scala-cli lockfile (kind = \"scala-cli\") but got kind = \"${kind}\". Use buildCoursierApp for coursier-app lockfiles."
         else true;
       native = target: target.native or null;
+      js = target: target.js or null;
       test = target: target.test or null;
     in assert versionCheck; assert kindCheck; {
       sources = json.sources or [];
@@ -31,6 +39,7 @@ let
       targets = builtins.mapAttrs (name: target:
         let
           n = native target;
+          j = js target;
           t = test target;
         in {
           inherit (target) platform scalaVersion;
@@ -38,6 +47,9 @@ let
           libraryDependencies = fetchAll target.libraryDependencies;
           nativeToolingDependencies = if n != null then fetchAll n.toolingDependencies else [];
           scalaNativeVersion = if n != null then n.scalaNativeVersion else null;
+          jsToolingDependencies = if j != null then fetchAll j.toolingDependencies else [];
+          scalaJsVersion = if j != null then j.scalaJsVersion else null;
+          scalaJsCliVersion = if j != null then j.scalaJsCliVersion else null;
           test =
             if t != null
             then {
@@ -98,7 +110,9 @@ let
 
   # Map lockfile platform name to --platform flag value
   platformFlag = platform:
-    if platform == "Native" then "scala-native" else "jvm";
+    if platform == "Native" then "scala-native"
+    else if platform == "JS" then "scala-js"
+    else "jvm";
 
   # `--platform <p>` plus, for Native targets, `--native-version <v>` so
   # `scala-cli package`/`test` uses the Scala Native version recorded in the
@@ -106,10 +120,21 @@ let
   # Without this, builds break whenever the locking and building scala-cli
   # versions disagree on the bundled Scala Native (e.g. fork on 0.5.11 vs
   # nixpkgs on 0.5.10).
+  #
+  # JS is analogous: `--js-version <v>` pins the Scala.js version to the locked
+  # linker, and `--js-cli-on-jvm` forces the linker to run from the Coursier
+  # cache on the JVM (instead of downloading a per-OS `scala-js-ld` binary from
+  # GitHub, which the sandbox can't reach). Module kind / opt mode come from the
+  # project's `using` directives, so they don't need to be passed here.
   platformArgs = fetched:
     "--platform ${platformFlag fetched.platform}" +
     (if fetched.scalaNativeVersion != null
      then " --native-version ${fetched.scalaNativeVersion}"
+     else "") +
+    (if fetched.scalaJsVersion != null
+     then " --js-version ${fetched.scalaJsVersion}"
+        + " --js-cli-version ${fetched.scalaJsCliVersion}"
+        + " --js-cli-on-jvm"
      else "");
 
   # Common scala-cli sandbox env setup, shared by JVM/Native build and test phases
@@ -194,11 +219,45 @@ let
       '';
     }) "Native");
 
+  buildJsTest = { pname, version, src, sources, resourceDirs, fetched, attrOverrides }:
+    let
+      mainAndTestSources = sources ++ fetched.test.sources;
+      mainAndTestResourceDirs = resourceDirs ++ fetched.test.resourceDirs;
+      # See buildJvmTest for why we pass the project tree, not file args.
+      inherit (prepareSources mainAndTestSources mainAndTestResourceDirs src) filteredSrc;
+      # Main + test scope winners, plus the JS linker tooling so `scala-cli test
+      # --platform js --js-cli-on-jvm` can link the test bundle offline.
+      allDeps = fetched.compiler ++ fetched.libraryDependencies ++ fetched.test.libraryDependencies
+        ++ fetched.jsToolingDependencies;
+      depsCache = mkCacheDir "scala-cli-test-deps-${pname}" allDeps;
+    in stdenv.mkDerivation (attrOverrides ({
+      pname = "${pname}-test";
+      inherit version;
+      dontUnpack = true;
+      buildInputs = [ scalaCliJs openjdk ];
+      COURSIER_CACHE = depsCache;
+      # See buildJvmTest for why we run from a writable copy of the tree.
+      buildPhase = scalaCliEnvSetup + ''
+        cp -r ${filteredSrc} $TMPDIR/proj
+        chmod -R u+w $TMPDIR/proj
+        cd $TMPDIR/proj
+        scala-cli --power test . --server=false --offline \
+          ${platformArgs fetched} \
+          --scala-version ${fetched.scalaVersion}
+      '';
+      installPhase = ''
+        mkdir -p $out
+        touch $out/passed
+      '';
+    }) "JS");
+
   # Build the test derivation attrset for passthru.tests, or {} if no tests.
   mkTests = { pname, version, src, sources, resourceDirs, fetched, attrOverrides }:
     if fetched.test == null then {}
     else if fetched.platform == "Native"
     then { test = buildNativeTest { inherit pname version src sources resourceDirs fetched attrOverrides; }; }
+    else if fetched.platform == "JS"
+    then { test = buildJsTest { inherit pname version src sources resourceDirs fetched attrOverrides; }; }
     else { test = buildJvmTest { inherit pname version src sources resourceDirs fetched attrOverrides; }; };
 
   buildJvmApp = { pname, version, src, sources, resourceDirs, fetched, mainClass, attrOverrides }:
@@ -347,6 +406,36 @@ let
       installPhase = "true";
     }) "Native");
 
+  # Scala.js (frontend) build: link the app to a single ES-module JS file at
+  # `$out/share/<pname>.js`. There is no node runtime and no `$out/bin` wrapper
+  # — the output is meant to be bundled by a downstream tool (e.g. vite) the
+  # same way `scala-cli package --js -o main.js` feeds a web build outside Nix.
+  buildJsApp = { pname, version, src, sources, resourceDirs, fetched, mainClass, attrOverrides }:
+    let
+      inherit (prepareSources sources resourceDirs src) sourceArgs;
+      allDeps = fetched.compiler ++ fetched.libraryDependencies
+        ++ fetched.jsToolingDependencies;
+      depsCache = mkCacheDir "scala-cli-deps-${pname}" allDeps;
+      tests = mkTests { inherit pname version src sources resourceDirs fetched attrOverrides; };
+    in stdenv.mkDerivation (attrOverrides ({
+      inherit pname version;
+      dontUnpack = true;
+      buildInputs = [ scalaCliJs openjdk ];
+      passthru = { inherit tests; };
+
+      COURSIER_CACHE = depsCache;
+
+      buildPhase = scalaCliEnvSetup + ''
+        mkdir -p $out/share
+        scala-cli --power package ${sourceArgs} --server=false --offline \
+          ${platformArgs fetched} \
+          --scala-version ${fetched.scalaVersion} \
+          ${lib.optionalString (mainClass != null) "--main-class ${mainClass}"} \
+          -o $out/share/${pname}.js --force
+      '';
+      installPhase = "true";
+    }) "JS");
+
   buildTarget = { pname, version, src, sources, resourceDirs, targetFetched, mainClass ? null, nativeImage ? false, packaging ? "app", attrOverrides }:
     assert lib.assertMsg (builtins.elem packaging [ "app" "assembly" ])
       "scala-cli-nix: packaging must be \"app\" or \"assembly\" (got \"${packaging}\")";
@@ -359,6 +448,13 @@ let
       assert lib.assertMsg (packaging == "app")
         "scala-cli-nix: packaging = \"${packaging}\" is only valid for JVM targets (this target is Scala Native)";
       buildNativeApp { inherit pname version src sources resourceDirs attrOverrides; fetched = targetFetched; }
+    else if targetFetched.platform == "JS"
+    then
+      assert lib.assertMsg (!nativeImage)
+        "scala-cli-nix: nativeImage = true is only valid for JVM targets (this target is Scala.js)";
+      assert lib.assertMsg (packaging == "app")
+        "scala-cli-nix: packaging = \"${packaging}\" is only valid for JVM targets (this target is Scala.js)";
+      buildJsApp { inherit pname version src sources resourceDirs mainClass attrOverrides; fetched = targetFetched; }
     else if nativeImage
     then buildNativeImageApp { inherit pname version src sources resourceDirs mainClass attrOverrides; fetched = targetFetched; }
     else if packaging == "assembly"

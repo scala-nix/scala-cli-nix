@@ -15,7 +15,7 @@ Two phases: **lock** (outside Nix, with network) and **build** (inside Nix sandb
 - Both JARs and POMs must be in the lockfile. POMs are needed for offline Coursier resolution but filtered out of the runtime classpath.
 - Lockfile version is **9** (checked in `lib.nix` as `supportedVersion`). Multi-target `targets` map (even for single-target projects). The shape is discriminated by a top-level `kind` field: `"scala-cli"` (default, project sources) or `"coursier-app"` (Coursier coordinates only).
 - `lib.nix` exposes: `buildScalaCliApp` (single derivation, requires `target` if multi-target), `buildScalaCliApps` (attrset for cross projects), `buildCoursierApp` (for `kind = "coursier-app"` lockfiles), and `collectChecks` (flattens `passthru.tests` into `checks.<system>`).
-- `--platform` and `--scala-version` are always passed to `scala-cli package` and `scala-cli export --json` to select the correct target from multi-platform sources.
+- `--platform` and `--scala-version` are always passed to `scala-cli package` and `scala-cli export --json` to select the correct target from multi-platform sources. Platforms: JVM, Native, JS. JS targets are frontend-only (no node): the build links to `$out/share/<pname>.js`. JS *builds* run the Scala.js linker on the JVM from the offline cache (`--js-cli-on-jvm` + `--js-cli-version`), and use the bundled fork in-sandbox (`scalaCliJs` arg to `lib.nix`) because upstream scala-cli resolves the linker as a `<v>+` range that can't resolve offline.
 - CLI subcommands: `lock` (project sources), `lock-coords` (Coursier app channels or raw `--dep` coords), `init` (scaffold local) or `init <github-url>` (scaffold external build with `--src` semantics).
 
 ## Commands

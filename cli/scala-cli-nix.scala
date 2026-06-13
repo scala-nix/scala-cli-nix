@@ -45,6 +45,17 @@ case class NativeLockDeps(
     toolingDependencies: List[ArtifactEntry]
 ) derives Codec.AsObject
 
+/** JS-target tooling: the Scala.js linker, resolved as ordinary Coursier JARs
+  * so the build can run it on the JVM (`--js-cli-on-jvm`) entirely offline.
+  * `scalaJsVersion` is recorded so the build can pass `--js-version` to match
+  * the locked linker (and so a version bump shows up as staleness).
+  */
+case class JsLockDeps(
+    scalaJsVersion: String,
+    scalaJsCliVersion: String,
+    toolingDependencies: List[ArtifactEntry]
+) derives Codec.AsObject
+
 case class TestLock(
     sources: List[String],
     resourceDirs: List[String],
@@ -58,6 +69,7 @@ case class TargetLock(
     compiler: List[ArtifactEntry],
     libraryDependencies: List[ArtifactEntry],
     native: Option[NativeLockDeps],
+    js: Option[JsLockDeps],
     test: Option[TestLock]
 ) derives Codec.AsObject
 
@@ -129,10 +141,17 @@ case class NativeOptionsExport(
     toolingDependencies: List[ExportDependency]
 ) derives Decoder
 
+case class JsOptionsExport(
+    scalaJsVersion: String,
+    scalaJsCliVersion: String,
+    toolingDependencies: List[ExportDependency]
+) derives Decoder
+
 case class ExportInfo(
     scalaVersion: String,
     platform: Option[String],
     nativeOptions: Option[NativeOptionsExport],
+    jsOptions: Option[JsOptionsExport],
     scopes: Map[String, ExportScope]
 ) derives Decoder
 
@@ -363,13 +382,34 @@ def extraRepoUrlsFromResolvers(resolvers: List[String]): List[String] = {
 def fetchArtifacts(
     deps: Dependency*
 )(using repos: Repos): IO[List[(Artifact, File)]] =
+  fetchArtifactsForced(Nil, deps*)
+
+/** Like `fetchArtifacts`, but pins `(group, artifact) -> version` during
+  * resolution. Used for the Scala.js linker, where `scalajs-linker_2.13` must
+  * be forced to the project's Scala.js version (mirrors scala-cli's own
+  * `ScalaJsLinker.linkerCommand`); otherwise Coursier resolves whatever the
+  * `scalajscli_2.13` POM happens to pin and the linked output can diverge from
+  * a real `scala-cli package --js` run.
+  */
+def fetchArtifactsForced(
+    forced: List[(String, String, String)],
+    deps: Dependency*
+)(using repos: Repos): IO[List[(Artifact, File)]] =
   IO.blocking {
     val base = Fetch.create().addDependencies(deps*)
     val withRepos = repos.mavenRepositories match {
       case Nil => base
       case rs  => base.addRepositories(rs*)
     }
-    val result = withRepos.fetchResult()
+    val withForced =
+      if (forced.isEmpty) withRepos
+      else {
+        val params = forced.foldLeft(ResolutionParams.create()) {
+          case (p, (g, a, v)) => p.forceVersion(Module.of(g, a), v)
+        }
+        withRepos.withResolutionParams(params)
+      }
+    val result = withForced.fetchResult()
     result.getArtifacts().asScala.toList.map(e => (e.getKey, e.getValue))
   }
 
@@ -841,17 +881,21 @@ val resolveScalaCli: IO[String] =
 /** A cross-build target: one (platform, scalaVersion) combination. */
 case class Target(platform: String, scalaVersion: Option[String]) {
 
-  /** Platform name for the --platform flag (jvm -> jvm, native ->
-    * scala-native).
+  /** Platform name for the --platform flag (jvm -> jvm, native -> scala-native,
+    * js -> scala-js).
     */
   def platformFlag: String = platform match {
     case "native" => "scala-native"
+    case "js"     => "scala-js"
     case other    => other
   }
 
-  /** Platform name stored in the lockfile (jvm -> JVM, native -> Native). */
+  /** Platform name stored in the lockfile (jvm -> JVM, native -> Native, js ->
+    * JS).
+    */
   def platformLock: String = platform match {
     case "native" => "Native"
+    case "js"     => "JS"
     case _        => "JVM"
   }
 }
@@ -880,6 +924,7 @@ def listTargets(scalaCli: String, inputArgs: List[String]): IO[List[Target]] =
     .map(_.map { e =>
       val platform = e.platform match {
         case "Native" => "native"
+        case "JS"     => "js"
         case _        => "jvm"
       }
       Target(platform, e.scalaVersion)
@@ -1102,11 +1147,22 @@ private def computeTargetLockContent(
 
   scalaMajor match {
     case "3" | "2" =>
+      // The standard library is platform-suffixed: scala-cli resolves
+      // `scala3-library_sjs1_3` for Scala.js (and the JVM `scala3-library_3`
+      // for JVM/Native — Native's own `scala3lib_native` arrives via
+      // `injectedDependencies`). The JS suffix isn't reported in the export's
+      // injectedDependencies, so we add it here as a direct dep; otherwise
+      // `scala-cli package --offline` can't find `scala3-library_sjs1_3` in the
+      // cache. The compiler always runs on the JVM, so `scala3-compiler_3` is
+      // correct for every platform.
+      val isJs = target.platform == "js"
       val (compilerArtifact, libraryArtifact) = scalaMajor match {
         case "3" =>
+          val libArtifactId =
+            if (isJs) "scala3-library_sjs1_3" else "scala3-library_3"
           (
             Dependency.of("org.scala-lang", "scala3-compiler_3", scalaVersion),
-            Dependency.of("org.scala-lang", "scala3-library_3", scalaVersion)
+            Dependency.of("org.scala-lang", libArtifactId, scalaVersion)
           )
         case _ =>
           (
@@ -1173,6 +1229,28 @@ private def computeTargetLockContent(
           )
         }
 
+        jsLockDeps <- export_.jsOptions.traverse { opts =>
+          // The Scala.js linker is `scalajscli_2.13:<cliVer>+` with
+          // `scalajs-linker_2.13` forced to the project's Scala.js version —
+          // identical to scala-cli's `ScalaJsLinker.linkerCommand`. We resolve
+          // it as plain JARs so the build can run it on the JVM offline.
+          val toolingDeps = toDeps(opts.toolingDependencies)
+          val forced =
+            List(("org.scala-js", "scalajs-linker_2.13", opts.scalaJsVersion))
+          for {
+            _ <- step("Fetching Scala.js linker dependencies...")
+            toolingArtifacts <- fetchArtifactsForced(forced, toolingDeps*)
+            _ <- info(
+              s"Scala.js linker: ${C.bold}${toolingArtifacts.size}${C.reset} artifacts"
+            )
+            toolingEntries <- collectEntries(toolingArtifacts)
+          } yield JsLockDeps(
+            scalaJsVersion = opts.scalaJsVersion,
+            scalaJsCliVersion = opts.scalaJsCliVersion,
+            toolingDependencies = toolingEntries
+          )
+        }
+
         // Test scope: scala-cli runs a separate Coursier resolution that
         // combines user-declared test deps with scope-specific injections (JVM
         // test-runner, Native test-interface, JS test-bridge, plus the
@@ -1212,6 +1290,7 @@ private def computeTargetLockContent(
         compiler = compilerEntries,
         libraryDependencies = libEntries,
         native = nativeLockDeps,
+        js = jsLockDeps,
         test = testLock
       )
 

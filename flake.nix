@@ -24,8 +24,46 @@
         ];
       };
 
-      overlays.default = final: prev: {
-        scala-cli-nix = final.callPackage self.lib { scala-cli = prev.scala-cli; };
+      overlays.default = final: prev:
+        let
+          # The kubukoz/scala-cli fork release, used in two places:
+          #   1. At lock time, via SCALA_CLI_NIX_SCALA_CLI on the CLI wrapper
+          #      (the fork's `export --json` emits jsOptions / nativeOptions and
+          #      the `list-targets` subcommand the lock workflow depends on).
+          #   2. Inside the sandbox for Scala.js *builds* only (`scalaCliJs`
+          #      below): the JS linker needs the fork's exact-version pin to
+          #      resolve offline. JVM/Native builds keep using upstream
+          #      `prev.scala-cli`.
+          # Only linux-x86_64 and macos-arm64 assets are published, so the
+          # `throw` (and thus JS builds + the CLI) is unavailable on other
+          # systems — a pre-existing constraint, not new to JS support.
+          forkScalaCli =
+            let
+              assets = {
+                "aarch64-darwin" = {
+                  asset = "scala-cli-aarch64-apple-darwin.gz";
+                  sha256 = "0chvl2fywg8wyh0p5yndj4rj1y37ir7hzr9l66nd9xhkawazi2f1";
+                };
+                "x86_64-linux" = {
+                  asset = "scala-cli-x86_64-pc-linux.gz";
+                  sha256 = "1kkkb52v1aq8dl231bb0ldqj72fryajdmz0jkl2w6zqza3znl1j0";
+                };
+              };
+              asset = assets.${final.stdenv.hostPlatform.system}
+                or (throw "scala-cli fork release has no asset for ${final.stdenv.hostPlatform.system}");
+              src = final.fetchurl {
+                url = "https://github.com/kubukoz/scala-cli/releases/download/fork-eb675f4/${asset.asset}";
+                inherit (asset) sha256;
+              };
+            in (prev.scala-cli.override { jre = prev.jdk; }).overrideAttrs (old: {
+              version = "fork-eb675f4";
+              inherit src;
+            });
+        in {
+        scala-cli-nix = final.callPackage self.lib {
+          scala-cli = prev.scala-cli;
+          scalaCliJs = forkScalaCli;
+        };
 
         # scala-cli-nix CLI tool (init/lock), built by its own buildScalaCliApp.
         # Exposes both `scala-cli-nix` and the shorter `scn` alias.
@@ -34,36 +72,14 @@
         # `list-targets` and `export --json`). We pass the path to a
         # kubukoz/scala-cli fork release via SCALA_CLI_NIX_SCALA_CLI because the
         # fork has fixes the lock workflow depends on. This is internal —
-        # neither the sandboxed build (`lib.nix`) nor the user's PATH sees the
-        # fork.
+        # neither the sandboxed JVM/Native build (`lib.nix`) nor the user's PATH
+        # sees the fork (the JS build path does use it — see `scalaCliJs`).
         #
         # `scala-cli-nix-cli-native-image` is the same CLI built as a GraalVM
         # native image (no JVM at runtime). Slower to build, much faster to
         # start.
         inherit (
           let
-            forkScalaCli =
-              let
-                assets = {
-                  "aarch64-darwin" = {
-                    asset = "scala-cli-aarch64-apple-darwin.gz";
-                    sha256 = "15h6v107jzazhhpx0ljpxn8zbl1k8gr4csshcrcqd8f0crh19mmq";
-                  };
-                  "x86_64-linux" = {
-                    asset = "scala-cli-x86_64-pc-linux.gz";
-                    sha256 = "19bj9zqcv0krwmx3m5nr41vafhimf4ccmijlha7pv63yih2vj5sr";
-                  };
-                };
-                asset = assets.${final.stdenv.hostPlatform.system}
-                  or (throw "scala-cli fork release has no asset for ${final.stdenv.hostPlatform.system}");
-                src = final.fetchurl {
-                  url = "https://github.com/kubukoz/scala-cli/releases/download/fork-fee67bb/${asset.asset}";
-                  inherit (asset) sha256;
-                };
-              in (prev.scala-cli.override { jre = prev.jdk; }).overrideAttrs (old: {
-                version = "fork-fee67bb";
-                inherit src;
-              });
             wrapCli = name: base: final.symlinkJoin {
               inherit name;
               paths = [ base ];
@@ -162,6 +178,7 @@
           example-hello-http4s = pkgs.callPackage ./examples/hello-http4s/derivation.nix { };
           example-scala-native-ce-cross = pkgs.callPackage ./examples/scala-native-ce-cross/derivation.nix { };
           example-scala-resources = pkgs.callPackage ./examples/scala-resources/derivation.nix { };
+          example-scala3-js = pkgs.callPackage ./examples/scala3-js/derivation.nix { };
           example-scala3-native-image = pkgs.callPackage ./examples/scala3-native-image/derivation.nix { };
           example-scala3-assembly = pkgs.callPackage ./examples/scala3-assembly/derivation.nix { };
           example-scala3-shadowed-deps = pkgs.callPackage ./examples/scala3-shadowed-deps/derivation.nix { };
@@ -219,6 +236,23 @@
           example-scala-resources-native = mkOutputCheck { name = "example-scala-resources-native"; pkg = example-scala-resources.native; binName = "example-scala-resources"; expected = "hello from embedded resource!"; };
           example-scala3-native-image = mkOutputCheck { name = "example-scala3-native-image"; pkg = example-scala3-native-image; expected = "hello from graalvm native image!"; };
           example-scala3-assembly = mkOutputCheck { name = "example-scala3-assembly"; pkg = example-scala3-assembly; expected = "hello from assembly!"; };
+          # Scala.js (frontend) build emits a single linked ES module at
+          # $out/share/<pname>.js — no bin, no node. The check asserts the
+          # linker actually produced the bundle and that user code made it in
+          # (the `dom.console.log` string survives linking).
+          example-scala3-js = pkgs.runCommand "check-example-scala3-js" { } ''
+            js=${example-scala3-js}/share/example-scala3-js.js
+            if [ ! -s "$js" ]; then
+              echo "FAIL: linked JS bundle missing or empty at $js"
+              exit 1
+            fi
+            if ! grep -q "hello from scala-js!" "$js"; then
+              echo "FAIL: linked JS bundle does not contain expected user string"
+              exit 1
+            fi
+            echo "OK: scala3-js linked $(wc -c < "$js") bytes"
+            touch $out
+          '';
           # Regression: scala-java-time transitively pulls
           # portable-scala-reflect_native0.5_2.13, which pins scalalib_native0.5_2.13
           # to 2.13.8+0.5.2. scala-cli's combined resolution at build time picks
