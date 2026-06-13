@@ -65,6 +65,10 @@
           scalaCliJs = forkScalaCli;
         };
 
+        # Convenience: the offline-Coursier-cache builder, surfaced directly on
+        # the overlay (also available as `scala-cli-nix.mkCoursierCache`).
+        inherit (final.scala-cli-nix) mkCoursierCache;
+
         # scala-cli-nix CLI tool (init/lock), built by its own buildScalaCliApp.
         # Exposes both `scala-cli-nix` and the shorter `scn` alias.
         #

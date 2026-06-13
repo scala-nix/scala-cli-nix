@@ -77,6 +77,23 @@ let
       ) deps;
     in runCommand name {} (builtins.concatStringsSep "\n" linkCommands);
 
+  # Public: build an offline Coursier cache directory from a list of
+  # `{ url, sha256 }` entries (the same shape as a lockfile's `dependencies`).
+  # Each artifact is fetched as its own FOD and symlinked into the on-disk
+  # layout Coursier expects, so a tool that resolves dependencies *at runtime*
+  # (e.g. a Smithy/smithy4s codegen that calls a model assembler which pulls
+  # `alloy`/`smithy-model` from Maven) can run fully offline in the Nix sandbox
+  # by pointing `COURSIER_CACHE` at the result.
+  #
+  #   COURSIER_CACHE = scala-cli-nix.mkCoursierCache {
+  #     name = "my-runtime-deps";
+  #     deps = (builtins.fromJSON (builtins.readFile ./runtime-deps.lock.json)).dependencies;
+  #   };
+  #
+  # Include the `.pom` URLs alongside the `.jar`s — Coursier needs the POMs for
+  # offline resolution metadata.
+  mkCoursierCache = { name, deps }: mkCacheDir name (fetchAll deps);
+
   # Filter `src` down to the listed source files (and resource directories),
   # returning both the filtered source tree and a space-separated string of
   # source paths to feed scala-cli. Resource directories are included as
@@ -484,6 +501,10 @@ let
     };
 
 in {
+  # Build an offline Coursier cache from `{ url, sha256 }` entries. See the
+  # definition above for the rationale (runtime dependency resolution offline).
+  inherit mkCoursierCache;
+
   # Collect `passthru.tests` from every package in `packages` into a flat
   # checks-shaped attrset, mapping `<pkgName>-<testName>` to each test
   # derivation. Packages without a `passthru.tests` attrset contribute
