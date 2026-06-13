@@ -285,16 +285,26 @@ Example with a non-root project:
 - **Over-locking / over-fetching.** The lockfile records every JAR Coursier resolves for a target, but `scala-cli package --library` only puts a subset on the runtime classpath — anything evicted by version conflicts, or pulled in for compile-only / provided scopes, ends up in the lockfile and gets fetched at build time without being used. The waste is in download bandwidth and FOD count, not the final closure (unused JARs aren't on the wrapper classpath), but it does inflate `scala.lock.json` and slow down cold builds.
 - **Locking requires a forked `scala-cli`.** The lock workflow depends on fixes that haven't landed upstream, so the wrapped CLI shells out to a [`kubukoz/scala-cli`](https://github.com/kubukoz/scala-cli) fork release via `SCALA_CLI_NIX_SCALA_CLI`. The fork is internal — never on the user's PATH; the JVM/Native Nix sandbox builds use upstream `scala-cli`, and only the Scala.js build path uses the fork in-sandbox (it needs a linker-resolution fix that hasn't landed upstream). Either way it means only platforms with a published fork asset (currently `aarch64-darwin` and `x86_64-linux`) can run `scala-cli-nix lock` (or build Scala.js targets) out of the box. Other systems would need to either build the fork themselves or set `SCALA_CLI_NIX_SCALA_CLI` to a compatible binary.
 
-## Demo deployment
+## NixOS modules
 
-This repo also dogfoods itself: a cross JVM+Native http4s server
-([`examples/hello-http4s`](examples/hello-http4s/)) is built with
-`buildScalaCliApps` and deployed to a Hetzner box defined in
-[`hetzner-nixos/`](hetzner-nixos/). The NixOS config runs both targets side by
-side as `systemd.services.hello-http4s-native` (port 8080) and
-`systemd.services.hello-http4s-jvm` (port 8081), each fronted by caddy on its
-own subdomain. Deploys go via deploy-rs (`nix run .#deploy-server01`). Served
-at <https://hello-native.scala-cli-nix.kubukoz.com> and
+This repo ships two NixOS modules as flake outputs for deploying
+scala-cli-nix-built apps onto a host:
+
+- `nixosModules.http-apps` — a generic per-app deployment module
+  ([`nixos/http-apps.nix`](nixos/http-apps.nix)). Each `services.http-apps.<name>`
+  entry is fronted by caddy on its own domain and runs in one of three modes: a
+  host `systemd` unit, a declarative nixos-container (systemd-nspawn), or
+  docker via `virtualisation.oci-containers`.
+- `nixosModules.demo-apps` — pre-wires the cross JVM+Native http4s server
+  ([`examples/hello-http4s`](examples/hello-http4s/), built with
+  `buildScalaCliApps`) across all three modes
+  ([`nixos/demo-apps.nix`](nixos/demo-apps.nix)). A consuming host enables it
+  with `services.demo-apps = { enable = true; baseDomain = "..."; }` after
+  applying `overlays.default`.
+
+The actual Hetzner box that dogfoods these modules lives in a separate repo
+(`jk-hetzner`), which imports `demo-apps` and deploys via deploy-rs. The demo
+is served at <https://hello-native.scala-cli-nix.kubukoz.com> and
 <https://hello-jvm.scala-cli-nix.kubukoz.com>.
 
 ## License

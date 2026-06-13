@@ -3,9 +3,3 @@ known-users
 .direnv/
 .env.local
 .secrets/
-
-# hetzner-nixos / opentofu
-.terraform/
-.terraform.lock.hcl
-hetzner-nixos/terraform.tfstate
-hetzner-nixos/terraform.tfstate.backup

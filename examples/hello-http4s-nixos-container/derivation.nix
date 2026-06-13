@@ -8,7 +8,7 @@ testers.runNixOSTest {
   name = "scala-cli-nix-hello-http4s-nixos-container";
 
   nodes.machine = { ... }: {
-    imports = [ ../../hetzner-nixos/modules/http-apps.nix ];
+    imports = [ ../../nixos/http-apps.nix ];
 
     services.http-apps.hello-native-container = {
       package = example-hello-http4s.native;

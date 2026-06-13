@@ -1,36 +1,23 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "nixpkgs";
-    deploy-rs.url = "github:serokell/deploy-rs";
-    deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
-
-    # The smithy-exercises teaching site (ships the NixOS module + the site /
-    # validator packages; server01 imports it below). Its nixpkgs follows this
-    # flake so the whole closure resolves through a single nixpkgs.
-    smithy-exercises.url = "git+file:///Users/kubukoz/projects/smithy-exercises";
-    smithy-exercises.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, disko, deploy-rs, smithy-exercises, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
     in {
       lib = ./lib.nix;
 
-      nixosConfigurations.server01 = nixpkgs.lib.nixosSystem {
-        system = "x86_64-linux";
-        # Expose the smithy-exercises flake to configuration.nix (for its
-        # nixosModule + the site/validator packages it ships).
-        specialArgs = { inherit smithy-exercises; };
-        modules = [
-          disko.nixosModules.disko
-          # Make `pkgs.scala-cli-nix` available in configuration.nix so it can
-          # callPackage example derivations directly.
-          { nixpkgs.overlays = [ self.overlays.default ]; }
-          ./hetzner-nixos/configuration.nix
-        ];
+      # NixOS modules for deploying scala-cli-nix-built apps. `http-apps` is the
+      # generic per-app deployment module (host unit / nixos-container / docker);
+      # `demo-apps` pre-wires the hello-http4s example across all three modes.
+      # A consuming host must apply `self.overlays.default` (the example
+      # derivations resolve `pkgs.scala-cli-nix` from it). See the jk-hetzner
+      # repo for a concrete server that imports `demo-apps`.
+      nixosModules = {
+        http-apps = ./nixos/http-apps.nix;
+        demo-apps = ./nixos/demo-apps.nix;
       };
 
       overlays.default = final: prev:
@@ -130,46 +117,6 @@
         in {
           default = pkgs.scala-cli-nix-cli;
           inherit (pkgs) scala-cli-nix-cli-native-image;
-          # The wrapper is a plain shell script around the `deploy` binary,
-          # which deploy-rs ships for every supported system. Exposing it
-          # per-system lets `nix run .#deploy-server01` work from darwin too;
-          # deploy-rs builds the linux closure (system profile + each app
-          # profile) via the local store / configured remote builder.
-          deploy-server01 = pkgs.callPackage ./hetzner-nixos/deploy-server01.nix {
-            deploy-rs = deploy-rs.packages.${system}.default;
-            hostKey = "178.105.118.88 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/gUJ/hYY4swoEvQTxw7OAGpj3SQxTm9kg7gk7xOgax";
-          };
-        }
-      );
-
-      # deploy-rs configuration. Single `system` profile — the NixOS toplevel
-      # owns all services and binaries (including hello-http4s-native and
-      # hello-http4s-jvm declared in configuration.nix). `activate.nixos` runs
-      # switch-to-configuration on the target, which restarts changed units.
-      deploy.nodes.server01 = {
-        hostname = "178.105.118.88";
-        sshUser = "root";
-        user = "root";
-        profiles.system.path = deploy-rs.lib.x86_64-linux.activate.nixos
-          self.nixosConfigurations.server01;
-      };
-
-      devShells = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in {
-          # Used by the top-level .envrc. `withPlugins` bakes the hcloud
-          # provider into the tofu wrapper so `tofu init` does not need to
-          # fetch it from the registry.
-          default = pkgs.mkShellNoCC {
-            packages = [
-              # `external` and `null` are pulled in by the nixos-anywhere
-              # all-in-one module.
-              (pkgs.opentofu.withPlugins (p: [ p.hetznercloud_hcloud p.hashicorp_external p.hashicorp_null ]))
-              pkgs.nixos-anywhere
-              deploy-rs.packages.${system}.default
-            ];
-          };
         }
       );
 
