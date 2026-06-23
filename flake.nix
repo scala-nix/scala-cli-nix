@@ -5,7 +5,7 @@
 
   outputs = { self, nixpkgs, ... }:
     let
-      forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
+      forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
     in {
       lib = ./lib.nix;
 
@@ -114,7 +114,8 @@
             inherit system;
             overlays = [ self.overlays.default ];
           };
-        in {
+          hasFork = builtins.elem system [ "x86_64-linux" "aarch64-darwin" ];
+        in nixpkgs.lib.optionalAttrs hasFork {
           default = pkgs.scala-cli-nix-cli;
           inherit (pkgs) scala-cli-nix-cli-native-image;
         }
@@ -129,6 +130,7 @@
           # Pull `passthru.tests` from every package in `self.packages.<system>`
           # into checks via the library helper — same code path as a generated
           # user flake, so the CLI's munit suite runs under `nix flake check`.
+          hasFork = builtins.elem system [ "x86_64-linux" "aarch64-darwin" ];
           packageTests = pkgs.scala-cli-nix.collectChecks self.packages.${system};
           example = pkgs.callPackage ./examples/scala3/derivation.nix { };
           example-scala3-subset = pkgs.callPackage ./examples/scala3-subset/derivation.nix { };
@@ -196,23 +198,6 @@
           example-scala-resources-native = mkOutputCheck { name = "example-scala-resources-native"; pkg = example-scala-resources.native; binName = "example-scala-resources"; expected = "hello from embedded resource!"; };
           example-scala3-native-image = mkOutputCheck { name = "example-scala3-native-image"; pkg = example-scala3-native-image; expected = "hello from graalvm native image!"; };
           example-scala3-assembly = mkOutputCheck { name = "example-scala3-assembly"; pkg = example-scala3-assembly; expected = "hello from assembly!"; };
-          # Scala.js (frontend) build emits a single linked ES module at
-          # $out/share/<pname>.js — no bin, no node. The check asserts the
-          # linker actually produced the bundle and that user code made it in
-          # (the `dom.console.log` string survives linking).
-          example-scala3-js = pkgs.runCommand "check-example-scala3-js" { } ''
-            js=${example-scala3-js}/share/example-scala3-js.js
-            if [ ! -s "$js" ]; then
-              echo "FAIL: linked JS bundle missing or empty at $js"
-              exit 1
-            fi
-            if ! grep -q "hello from scala-js!" "$js"; then
-              echo "FAIL: linked JS bundle does not contain expected user string"
-              exit 1
-            fi
-            echo "OK: scala3-js linked $(wc -c < "$js") bytes"
-            touch $out
-          '';
           # Regression: scala-java-time transitively pulls
           # portable-scala-reflect_native0.5_2.13, which pins scalalib_native0.5_2.13
           # to 2.13.8+0.5.2. scala-cli's combined resolution at build time picks
@@ -272,6 +257,27 @@
             esac
           '';
           external-scala-monitor-test-scope = external-scala-monitor.passthru.tests.test;
+        } // nixpkgs.lib.optionalAttrs hasFork {
+          # Scala.js (frontend) build emits a single linked ES module at
+          # $out/share/<pname>.js — no bin, no node. The check asserts the
+          # linker actually produced the bundle and that user code made it in
+          # (the `dom.console.log` string survives linking).
+          # Gated to fork-supported systems (x86_64-linux, aarch64-darwin) because
+          # the JS build path uses the kubukoz/scala-cli fork (scalaCliJs), which
+          # has no aarch64-linux release asset.
+          example-scala3-js = pkgs.runCommand "check-example-scala3-js" { } ''
+            js=${example-scala3-js}/share/example-scala3-js.js
+            if [ ! -s "$js" ]; then
+              echo "FAIL: linked JS bundle missing or empty at $js"
+              exit 1
+            fi
+            if ! grep -q "hello from scala-js!" "$js"; then
+              echo "FAIL: linked JS bundle does not contain expected user string"
+              exit 1
+            fi
+            echo "OK: scala3-js linked $(wc -c < "$js") bytes"
+            touch $out
+          '';
         } // (
           # Cross JVM+Native test-framework examples. Each framework gets its
           # own example built for both platforms; for every (framework,
