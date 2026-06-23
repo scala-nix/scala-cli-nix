@@ -5,14 +5,14 @@
 # resolves offline (upstream still uses a range, which needs version-listing
 # metadata the sandbox cache doesn't carry). JVM/Native builds keep using the
 # unmodified upstream `scala-cli`.
-{ scala-cli, scalaCliJs ? scala-cli, openjdk, makeWrapper, runCommand, stdenv, lib, clang, which, graalvmPackages, fetchurl, bash }:
+{ scala-cli, scalaCliJs ? scala-cli, openjdk, makeWrapper, runCommand, stdenv, lib, clang, which, graalvmPackages, fetchurl, bash, urlTransform ? (url: url) }:
 let
   supportedVersion = 9;
 
   # Each fetchurl produces its own FOD — per-artifact granularity, and Nix
   # realizes them in parallel (unlike builtins.fetchurl, which would block the
   # single-threaded evaluator on each download sequentially).
-  fetchAll = deps: builtins.map (dep: { inherit dep; path = fetchurl { inherit (dep) url sha256; }; }) deps;
+  fetchAll = deps: builtins.map (dep: { inherit dep; path = fetchurl { url = urlTransform dep.url; inherit (dep) sha256; }; }) deps;
 
   # Common version + kind check shared by both lockfile loaders.
   checkLockVersion = lockVersion:

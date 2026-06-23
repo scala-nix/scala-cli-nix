@@ -235,6 +235,22 @@ The classpath filters out POM files (`builtins.match ".*\\.jar"`) since only JAR
 
 ### Overlay (`flake.nix`)
 
+The flake exposes two overlay entry points:
+
+- `overlays.default` — the standard overlay; equivalent to `overlays.withConfig {}`.
+- `overlays.withConfig { urlTransform ? (url: url) }` — parameterised variant for corporate environments. `urlTransform` is applied to every artifact URL before it reaches `fetchurl`, so Maven Central fetches can be redirected to a private mirror (e.g. Artifactory). Because Nix FOD hashes are content-based, a mirror serving identical bytes satisfies the same `sha256`. Usage in a downstream flake:
+
+```nix
+overlays = [
+  (scala-cli-nix.overlays.withConfig {
+    urlTransform = url: builtins.replaceStrings
+      [ "https://repo1.maven.org/maven2" ]
+      [ "https://artifactory.corp/artifactory/maven-central" ]
+      url;
+  })
+];
+```
+
 The overlay provides two packages:
 
 | Package | Description |
