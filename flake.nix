@@ -20,12 +20,15 @@
         demo-apps = ./nixos/demo-apps.nix;
       };
 
-      # `overlays.withConfig { urlTransform }` lets callers rewrite every
-      # artifact URL before it reaches `fetchurl` — use it to redirect Maven
-      # Central fetches to a private mirror (e.g. Artifactory). Nix FOD hashes
-      # are content-based, so a mirror serving identical bytes satisfies the
-      # same sha256. `overlays.default` is `withConfig {}` (identity transform).
-      overlays.withConfig = { urlTransform ? (url: url) }: final: prev:
+      # `withConfig { urlTransform }` lets callers rewrite every artifact URL
+      # before it reaches `fetchurl` — use it to redirect Maven Central fetches
+      # to a private mirror (e.g. Artifactory). Nix FOD hashes are
+      # content-based, so a mirror serving identical bytes satisfies the same
+      # sha256. `overlays.default` is `withConfig {}` (identity transform).
+      # NOTE: intentionally not placed under `overlays.*` — Nix validates every
+      # entry in that attrset as a two-argument overlay function, and this is a
+      # factory function that takes `{ urlTransform }` first.
+      withConfig = { urlTransform ? (url: url) }: final: prev:
         let
           # The kubukoz/scala-cli fork release, used in two places:
           #   1. At lock time, via SCALA_CLI_NIX_SCALA_CLI on the CLI wrapper
@@ -113,7 +116,7 @@
           }
         ) scala-cli-nix-cli scala-cli-nix-cli-native-image;
       };
-      overlays.default = self.overlays.withConfig {};
+      overlays.default = self.withConfig {};
 
       packages = forAllSystems (system:
         let

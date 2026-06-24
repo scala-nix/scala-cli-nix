@@ -985,6 +985,16 @@ case class LockCoordsOptions(
     output: Option[String] = None
 )
 
+case class DedupCacheOptions(
+    @HelpMessage("Apply changes without asking for confirmation.")
+    @Name("y")
+    yes: Boolean = false,
+    @HelpMessage(
+      "Create GC roots in /nix/var/nix/gcroots/per-user/<user>/scala-cli-nix-dedup/ to protect the linked store paths from Nix garbage collection. Without this flag, symlinks may dangle after `nix store gc` if the store paths are no longer referenced by any profile."
+    )
+    gcRoots: Boolean = false
+)
+
 // --- Lock command ---
 
 val hashPrinter: Printer = Printer.noSpaces.copy(sortKeys = true)
@@ -2501,6 +2511,174 @@ private def writeCoordsLock(
           success(s"Wrote ${C.bold}${target.fileName}${C.reset}")
   } yield ()
 
+// --- dedup-cache command ---
+
+private def formatBytes(bytes: Long): String =
+  if (bytes < 1024) s"${bytes} B"
+  else if (bytes < 1024 * 1024) f"${bytes.toDouble / 1024}%.1f KB"
+  else if (bytes < 1024 * 1024 * 1024)
+    f"${bytes.toDouble / (1024 * 1024)}%.1f MB"
+  else f"${bytes.toDouble / (1024 * 1024 * 1024)}%.1f GB"
+
+/** Walk all JAR/POM files in the Coursier cache, find those that already exist
+  * verbatim in the Nix store, and replace them with symlinks — freeing the
+  * duplicated disk space while keeping Coursier's cache layout intact.
+  *
+  * Discovery:
+  *   1. List `/nix/store` at depth 1 and index every `*.jar` / `*.pom` file by
+  *      its basename (everything after the 32-char hash prefix).
+  *   2. Walk the Coursier cache recursively, skipping existing symlinks.
+  *   3. For each regular `.jar` / `.pom` file, look up candidates in the index
+  *      by basename, then confirm identity by comparing file sizes and SHA-256
+  *      hashes before counting it as a duplicate.
+  *
+  * Sidecars (`.sha1`, `.sha256`, etc.) are left untouched — they record the
+  * content hash of the artifact, which does not change when the artifact is
+  * replaced by a symlink.
+  *
+  * GC resistance: by default, symlinks into `/nix/store` may dangle after
+  * `nix store gc` if the referenced paths are no longer needed by any installed
+  * profile. Pass `--gc-roots` to also register them in
+  * `/nix/var/nix/gcroots/per-user/<user>/scala-cli-nix-dedup/`.
+  */
+def dedupCache(opts: DedupCacheOptions): IO[ExitCode] = withHashCache {
+  val nixStore = Path("/nix/store")
+
+  for {
+    nixStoreExists <- Files[IO].exists(nixStore)
+    result <-
+      if (!nixStoreExists)
+        error("No Nix store found at /nix/store.").as(ExitCode.Error)
+      else
+        for {
+          _ <- step("Scanning Nix store for JAR/POM files...")
+          // Nix store paths: /nix/store/<32-char-base32-hash>-<original-name>
+          // We strip the 33-character prefix (<hash> + '-') to get the basename.
+          nixIndex <- Files[IO]
+            .list(nixStore)
+            .filter { p =>
+              val n = p.fileName.toString
+              n.endsWith(".jar") || n.endsWith(".pom")
+            }
+            .compile
+            .toList
+            .map(_.groupMap(p => p.fileName.toString.drop(33))(identity))
+          _ <- info(
+            s"Indexed ${nixIndex.values.map(_.size).sum} JAR/POM files in the Nix store"
+          )
+
+          _ <- step("Scanning Coursier cache for duplicates...")
+          duplicates <- Files[IO]
+            .walk(cachePath)
+            .evalMap { p =>
+              Files[IO]
+                .getBasicFileAttributes(p, followLinks = false)
+                .map(a => Option.when(a.isRegularFile)(p))
+            }
+            .collect { case Some(p) => p }
+            .filter { p =>
+              val n = p.fileName.toString
+              n.endsWith(".jar") || n.endsWith(".pom")
+            }
+            .evalMap { cacheFile =>
+              val basename = cacheFile.fileName.toString
+              nixIndex.get(basename) match {
+                case None             => IO.pure(None)
+                case Some(candidates) =>
+                  for {
+                    cacheSize <- Files[IO]
+                      .getBasicFileAttributes(cacheFile)
+                      .map(_.size)
+                    matched <- candidates.findM { nixPath =>
+                      Files[IO]
+                        .getBasicFileAttributes(nixPath)
+                        .flatMap { nixAttrs =>
+                          if (nixAttrs.size != cacheSize) IO.pure(false)
+                          else
+                            sha256Base64(cacheFile).flatMap { h1 =>
+                              sha256Base64(nixPath).map(_ == h1)
+                            }
+                        }
+                        .handleError(_ => false)
+                    }
+                  } yield matched
+                    .map(nixPath => (cacheFile, nixPath, cacheSize))
+              }
+            }
+            .collect { case Some(t) => t }
+            .compile
+            .toList
+
+          exitCode <-
+            if (duplicates.isEmpty)
+              info("No duplicates found.").as(ExitCode.Success)
+            else {
+              val totalBytes = duplicates.map(_._3).sum
+              for {
+                _ <- errln("")
+                _ <- errln(
+                  s"Found ${C.bold}${duplicates.size}${C.reset} duplicate files " +
+                    s"(${C.bold}${formatBytes(totalBytes)}${C.reset} total):"
+                )
+                _ <- duplicates.traverse_ { case (src, dst, size) =>
+                  errln(s"  ${C.dim}$src${C.reset}") *>
+                    errln(
+                      s"    -> ${C.green}$dst${C.reset} (${formatBytes(size)})"
+                    )
+                }
+                _ <- errln("")
+                proceed <-
+                  if (opts.yes) IO.pure(true)
+                  else
+                    IO.blocking(
+                      scala.io.StdIn.readLine(
+                        s"Replace ${duplicates.size} files with symlinks? [y/N] "
+                      )
+                    ).map(r => r != null && (r == "y" || r == "Y"))
+                exitCode <-
+                  if (!proceed)
+                    info("Aborted.").as(ExitCode.Success)
+                  else
+                    for {
+                      _ <- step("Replacing files with symlinks...")
+                      _ <- duplicates.traverse_ { case (src, dst, _) =>
+                        Files[IO].delete(src) *>
+                          Files[IO].createSymbolicLink(src, dst)
+                      }
+                      _ <- IO.whenA(opts.gcRoots) {
+                        val username =
+                          sys.props.getOrElse("user.name", "unknown")
+                        val gcRootsDir =
+                          Path(
+                            s"/nix/var/nix/gcroots/per-user/$username/scala-cli-nix-dedup"
+                          )
+                        Files[IO].createDirectories(gcRootsDir) *>
+                          duplicates
+                            .traverse_ { case (_, nixPath, _) =>
+                              val linkName = nixPath.fileName.toString
+                              Files[IO]
+                                .createSymbolicLink(
+                                  gcRootsDir / linkName,
+                                  nixPath
+                                )
+                                .handleError(_ => ())
+                            } *>
+                          info(
+                            s"Created GC roots in ${C.dim}$gcRootsDir${C.reset}"
+                          )
+                      }
+                      _ <- errln("")
+                      _ <- success(
+                        s"Replaced ${C.bold}${duplicates.size}${C.reset} files with symlinks, " +
+                          s"freed ${C.bold}${formatBytes(totalBytes)}${C.reset}"
+                      )
+                    } yield ExitCode.Success
+              } yield exitCode
+            }
+        } yield exitCode
+  } yield result
+}
+
 // --- Main ---
 
 /** Run an `IO[ExitCode]` and exit the JVM with the resulting code. We bridge
@@ -2522,7 +2700,7 @@ object ScalaCliNix extends CommandsEntryPoint {
   override def progName: String = "scala-cli-nix"
   override def description: String = "Nix packaging for scala-cli apps"
   override def commands: Seq[Command[?]] =
-    Seq(InitCommand, LockCommand, LockCoordsCommand)
+    Seq(InitCommand, LockCommand, LockCoordsCommand, DedupCacheCommand)
   override def enableCompleteCommand: Boolean = true
   override def enableCompletionsCommand: Boolean = true
 
@@ -2552,5 +2730,11 @@ object ScalaCliNix extends CommandsEntryPoint {
       }
       runIO(lockCoords(options, appName))
     }
+  }
+
+  private object DedupCacheCommand extends Command[DedupCacheOptions] {
+    override def name: String = "dedup-cache"
+    override def run(options: DedupCacheOptions, args: RemainingArgs): Unit =
+      runIO(dedupCache(options))
   }
 }
