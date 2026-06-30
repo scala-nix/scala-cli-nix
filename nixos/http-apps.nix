@@ -185,7 +185,14 @@ in
     services.caddy = {
       enable = true;
       virtualHosts = lib.mapAttrs' (name: app: {
-        name = app.domain;
+        # `http://` prefix tells Caddy to serve this vhost over plain HTTP
+        # and skip automatic HTTPS / ACME certificate provisioning. TLS
+        # termination can be layered on top by the consuming flake if needed,
+        # but this module manages only the reverse-proxy layer. Without the
+        # prefix Caddy tries Let's Encrypt for every hostname — which hangs
+        # (and redirects HTTP→HTTPS) in sandboxed environments like NixOS VM
+        # tests that have no internet access.
+        name = "http://${app.domain}";
         # For containerised apps caddy talks to the guest directly over
         # the veth pair (localAddress). Host and docker modes both
         # listen on 127.0.0.1 — docker via `-p 127.0.0.1:<port>:<port>`.
