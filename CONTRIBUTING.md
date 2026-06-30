@@ -22,7 +22,7 @@ Credentials for private repos are loaded *automatically* by Coursier from `~/.co
 
 At Nix build time, `pkgs.fetchurl` fetches each lockfile URL directly. If the Artifactory repo requires auth, configure Nix's standard `netrc-file` (or place credentials in `~/.netrc`) — the FOD download then succeeds against the same URL the lock recorded. No changes to `lib.nix` are needed.
 
-For `lock-coords` (no scala-cli source files, so no `resolvers[]`), pass extra repos via repeatable `--repository <URL>` flags.
+For `lock-coords` (no scala-cli source files, so no `resolvers[]`), pass extra repos via repeatable `--repository <URL>` flags. If you want *only* those repos and no Maven Central (e.g. everything is mirrored in a private Artifactory instance), also pass `--no-default-repositories`; this replaces the Coursier default repository list (ivy2Local + Maven Central) entirely with the `--repository` URLs.
 
 #### Locking external sources (`lock --src <dir>`)
 

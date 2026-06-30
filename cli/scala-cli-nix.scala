@@ -346,14 +346,20 @@ def absolutePath(s: String): IO[Path] = {
 /** Extra Maven repositories to add to every Coursier fetch — populated from
   * `//> using repository` directives (read from scala-cli's export JSON) on the
   * `lock` path, and from `--repository` flags on `lock-coords`. Maven Central
-  * is always implicitly included by Coursier's defaults; we only add the
-  * non-default repos here.
+  * is always implicitly included by Coursier's defaults unless `noDefaults` is
+  * true (set by `--no-default-repositories` on `lock-coords`); we only add the
+  * non-default repos otherwise.
+  *
+  * When `noDefaults = true`, `urls` replaces the full repository list (ivy2Local
+  * + Maven Central are not included), so all artifacts must be reachable from
+  * the explicitly-listed repos. Useful when everything is mirrored in a private
+  * Artifactory/Nexus instance and Maven Central should not be contacted.
   *
   * Credentials are loaded by Coursier itself from
   * `~/.config/coursier/credentials.properties` (and `COURSIER_CREDENTIALS` /
   * `COURSIER_CONFIG_DIR`), so we don't have to wire them through.
   */
-case class Repos(urls: List[String]) {
+case class Repos(urls: List[String], noDefaults: Boolean = false) {
   def mavenRepositories: List[MavenRepository] =
     urls.distinct.map(MavenRepository.of(_))
 }
@@ -397,10 +403,14 @@ def fetchArtifactsForced(
 )(using repos: Repos): IO[List[(Artifact, File)]] =
   IO.blocking {
     val base = Fetch.create().addDependencies(deps*)
-    val withRepos = repos.mavenRepositories match {
-      case Nil => base
-      case rs  => base.addRepositories(rs*)
-    }
+    val withRepos =
+      if (repos.noDefaults)
+        base.withRepositories(repos.mavenRepositories*)
+      else
+        repos.mavenRepositories match {
+          case Nil => base
+          case rs  => base.addRepositories(rs*)
+        }
     val withForced =
       if (forced.isEmpty) withRepos
       else {
@@ -972,6 +982,10 @@ case class LockCoordsOptions(
       "Extra Maven repository URL to add to Coursier resolution (e.g. an Artifactory virtual repo). Repeatable. Credentials are loaded from ~/.config/coursier/credentials.properties (or COURSIER_CREDENTIALS / COURSIER_CONFIG_DIR)."
     )
     repository: List[String] = Nil,
+    @HelpMessage(
+      "Do not include Maven Central (or ivy2Local) in the Coursier resolution. All artifacts must be reachable from the --repository URLs. Useful when everything is mirrored in a private Artifactory/Nexus instance and Maven Central should not be contacted."
+    )
+    noDefaultRepositories: Boolean = false,
     @HelpMessage(
       "Main class for raw --dep mode. Optional: if omitted, auto-discovered from the Main-Class attribute in the --dep JARs' META-INF/MANIFEST.MF."
     )
@@ -2417,7 +2431,7 @@ def lockCoords(
     opts: LockCoordsOptions,
     appName: Option[String]
 )(using Client[IO]): IO[ExitCode] = withHashCache {
-  given Repos = Repos(opts.repository.distinct)
+  given Repos = Repos(opts.repository.distinct, opts.noDefaultRepositories)
   for {
     _ <- opts.repository.distinct.traverse_(url =>
       info(s"Extra repository: ${C.bold}$url${C.reset}")
