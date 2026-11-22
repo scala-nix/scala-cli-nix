@@ -4,6 +4,8 @@
 
 scala-cli-nix has two phases: **lock** (runs outside Nix, has network) and **build** (runs inside Nix sandbox, no network). This split exists because Nix builds are sandboxed — JVM dependencies must be pre-fetched with known hashes.
 
+Three lockfile shapes share that split, discriminated by a top-level `kind`: `"scala-cli"` (the default, project sources driven by scala-cli), `"coursier-app"` (an app packaged straight from Coursier coordinates), and `"sbt"` (an sbt-managed project, built by running real sbt inside the sandbox).
+
 ### Phase 1: Locking (`scala-cli-nix lock`)
 
 Implemented in `cli/scala-cli-nix.scala` (Scala 3). The CLI is itself built by `buildScalaCliApp` (self-hosting). At runtime, the CLI needs a `scala-cli` binary to shell out to: it reads the absolute path from `SCALA_CLI_NIX_SCALA_CLI` if set, otherwise falls back to whatever `scala-cli` is on PATH. The Nix-built `scala-cli-nix-cli` derivation sets that env var to a bundled fork release (see "Overlay" below).
@@ -336,15 +338,130 @@ JVM resolves `user.home` from the OS user database (macOS) or `/etc/passwd` (Lin
 
 `makeWrapper` would bake `-Duser.home=...` at build time, but we don't have a writable path until runtime. The wrapper checks `$HOME` for writability at exec time, falling back to `$TMPDIR` or `/tmp`. That keeps normal user invocations on `$HOME` and rescues sandbox / odd CI environments without forcing the user to set anything.
 
+### `scala-cli-nix lock-sbt` (sbt path)
+
+A third lockfile shape, `kind = "sbt"`, for projects built by sbt rather than scala-cli. The split from the other two paths is fundamental: we don't drive the compiler ourselves, we run **real sbt inside the Nix sandbox**. Reimplementing an sbt build definition isn't tractable, so instead the lock phase captures a complete, offline sbt installation and the build phase hands it to the project's own sbt version.
+
+#### Lock phase
+
+`scn lock-sbt` shells out to sbt (from `SCALA_CLI_NIX_SBT`, set by the Nix wrapper to `pkgs.sbt`; falls back to `sbt` on PATH). It writes two throwaway task files, runs them in one sbt invocation, and deletes them again:
+
+- `scn-manifest.sbt` in the project root — the `scnManifest` task. `ScopeFilter(inAnyProject)` plus `.all(...)` reads every setting once per project in the build, so a single invocation describes all modules.
+- `project/scn-manifest.sbt` — the `scnMetaManifest` task. Files under `project/` *are* the meta-build's build definition, which is where plugins live, so reaching it takes a `reload plugins` / `reload return` round trip. Both run in one command sequence: `sbt "reload plugins" scnMetaManifest "reload return" scnManifest`.
+
+Both tasks print hand-rolled JSON between sentinel lines (`##SCN_MANIFEST_BEGIN##` etc.) so sbt's own logging can be discarded. Hand-rolled because the meta-build has no JSON dependency and adding one would mean resolving it at an awkward moment.
+
+Notable details of what the manifest reports:
+
+- `Compile / unmanagedSources`, not `sources`. The latter includes generated files under `target/`, which don't exist in the sandbox and would be recorded as phantom paths. Self-contained source generators re-run inside the sandbox anyway — that's how the `sbt-multi` example's `BuildInfoPlugin` works.
+- `Compile / packageBin / artifactPath`, relative to the build root. It's a *setting*, so reading it is free, and it names each module's jar exactly — which is what makes multi-module work, since several jars can be collected without ambiguity.
+- `Compile / mainClass` is a *task* that compiles the project. Locking an sbt project therefore builds it once, at lock time, where there's still a network.
+- Each project's `dependencies` (its `dependsOn` ids). The CLI turns these into a transitive closure per module (`transitiveInternalDeps`).
+- `libraryDependencies` split by configuration: `% Test` (configurations starting with `test`) goes to the module's test scope, everything else — `None`, compile, runtime, default, provided, optional — to its main scope. Provided/optional deps land on the runtime classpath as a result; for a standalone app there's no container to supply them.
+- Paths outside the build root are dropped: they have no in-sandbox equivalent.
+
+sbt synthesizes an aggregate root project for builds whose `build.sbt` doesn't define one. It appears in the lockfile like any other module, with no sources and no main class.
+
+The CLI then resolves, per module, the main scope and (main ∪ test) scope separately — two modules can legitimately land on different winners for the same library, and each needs its own winner in cache. On top of that it resolves the sbt-side artifacts described under "Toolchain" below.
+
+**Plugins.** An `addSbtPlugin(...)` entry lands in the meta-build's `libraryDependencies` with `crossVersion = Disabled` and the marker attributes `e:sbtVersion` / `e:scalaVersion` (e.g. `1.0` and `2.12`). Those two values *are* the suffix of the published Maven artifact name — `sbt-buildinfo` is published as `sbt-buildinfo_2.12_1.0` — so the coordinate is built from the very attributes that define it rather than from separately-read settings. The closure then resolves through Coursier like any other dependency. The meta-build's *non*-plugin dependencies (its Scala 2.12 compiler, `compiler-bridge_2.12`, `scala-xml_2.12`, jline) need no separate locking: they all fall out of the `org.scala-sbt:sbt:<version>` resolution already captured in `bootCoursierCache`.
+
+#### Lockfile format (`kind = "sbt"`)
+
+```json
+{
+  "version": 9,
+  "kind": "sbt",
+  "sources": ["app/src/main/scala/app/Main.scala", "core/src/main/scala/core/Greeting.scala"],
+  "resourceDirs": ["core/src/main/resources"],
+  "modules": {
+    "app": {
+      "scalaVersion": "3.3.4",
+      "mainClass": "app.Main",
+      "packageBin": "app/target/scala-3.3.4/example-sbt-multi-app_3-0.1.0.jar",
+      "internalDependencies": ["core"],
+      "libraryDependencies": [ { "url": "...", "sha256": "..." } ],
+      "test": {
+        "sources": ["app/src/test/scala/app/MainTest.scala"],
+        "resourceDirs": [],
+        "libraryDependencies": [ { "url": "...", "sha256": "..." } ]
+      }
+    }
+  },
+  "pluginDependencies": [ { "url": "...", "sha256": "..." } ],
+  "sbt": {
+    "sbtVersion": "1.10.7",
+    "scalaBootVersion": "2.12.20",
+    "launcherJar": { "url": "...", "sha256": "..." },
+    "bootJars": [],
+    "bootCoursierCache": [],
+    "scalaInstance": [],
+    "compilerBridge": []
+  }
+}
+```
+
+There is no `targets` map: an sbt build picks its own platform and Scala version from `build.sbt`, so there's nothing to cross-build over. `modules` takes its place, keyed by sbt project id — even a single-project build gets exactly one entry.
+
+Field notes:
+
+- `sources` / `resourceDirs` are the **union** across modules' main scopes, because sbt loads and may compile the whole build even when asked for one module. Test sources stay per-module under `modules.<id>.test`.
+- `internalDependencies` is the *transitive* closure of `dependsOn`, excluding the module itself, sorted for determinism (sbt works out the real build order).
+- `pluginDependencies` is project-specific, so it sits at the top level rather than in `sbt`, where it would break toolchain sharing.
+- No `exportHash`: there's no `scala-cli export --json` to hash. Staleness detection on this path is just "re-run `scn lock-sbt` and diff".
+
+#### Toolchain (`mkSbtToolchain`)
+
+Two read-only derivations keyed **only** on `(sbtVersion, scalaBootVersion)` plus the locked sbt-side artifact hashes — nothing project-specific. Two projects on the same sbt + Scala versions share these exact store paths, and changing user source code doesn't invalidate them.
+
+- `sbt-boot-<sbtVersion>-<scalaBootVersion>`: a symlink farm in the launcher's boot layout.
+- `sbt-coursier-<sbtVersion>-<scalaBootVersion>`: `bootCoursierCache` ∪ `scalaInstance` ∪ `compilerBridge` in standard Coursier cache layout.
+
+The project's own dependencies and plugins are layered on top of `COURSIER_CACHE` at build time instead of being merged in here, precisely to keep the toolchain shareable.
+
+`scalaInstance` and `compilerBridge` are unioned over every distinct `scalaVersion` across the build's modules, so a build whose modules disagree on `scalaVersion` still resolves offline.
+
+#### Build phase (`buildSbtApp`)
+
+1. **Source filter** (`prepareSbtSources`): every root-level `*.sbt`, the whole `project/` tree, the locked sources, and the resource directories. `target/` dirs are dropped — they're the sandbox's to create, and a stale local one would both poison the derivation hash and let sbt mistake prebuilt classes for fresh ones.
+2. **Setup** (`mkSbtEnvSetup`): `cp -rs` the toolchain's boot dir and Coursier cache into writable tmpdirs (sbt writes into both — compiled compiler bridge, internal lockfiles — so the FOD paths can't be used in place; `-rs` symlinks back into the store, so this costs directory entries, not artifact copies), then layer the dependency and plugin caches on top. `HOME` is redirected because the sandbox's is `/homeless-shelter` or `/var/empty`.
+3. **Build**: `java <opts> -jar <locked sbt-launch.jar> <id>/package ... < /dev/null`, one `<id>/package` per module in the build closure.
+4. **Install**: each closure module's `packageBin` is copied to `$out/share/<pname>/<id>.jar`, and `makeWrapper` writes `$out/bin/<pname>` running `java -cp <main-scope jars>:<module jars> <mainClass>`.
+
+`buildSbtApp` takes `module` to select the sbt project; it may be omitted only when the lockfile has one module. `buildSbtApps` returns an attrset of every module that has a main class — library modules and sbt's synthesized aggregate root are skipped, since emitting entries that throw on evaluation would break `nix flake check` for the whole flake.
+
+A module's test scope, when it has one, is exposed as `passthru.tests.test` and runs `<id>/test` offline from a writable copy of the project tree. It's picked up by `collectChecks` like any other test.
+
+#### Hard-won pitfalls
+
+These cost real time and are worth not rediscovering:
+
+- **The boot directory name is load-bearing.** It must be `scala-<scalaBootVersion>`, not `<scalaBootVersion>`. The launcher accepts *any* directory under the boot dir, then recovers the Scala version by taking the substring after the last `"scala-"` in that directory's name (`BootConfiguration.extractScalaVersion`, with `ScalaVersionPrefix = "scala-"`). A bare `2.12.20` is accepted as a boot dir and then yields no version, which the launcher reports as **sbt#4955** — "sbt launcher is unable to detect the Scala version for org.scala-sbt:sbt; this likely indicates an incomplete artifact resolution and/or corrupt boot cache". The resolution is complete and the cache is fine; the directory is just misnamed.
+- **sbt#4955, for real this time.** It also fires when the launcher's flat boot dir contains *any* evicted-version or duplicate-artifactId jar. Hence the `bootJars` (resolved winners, laid out in the boot dir) / `bootCoursierCache` (full transitive set, for sbt's internal resolution) split.
+- **Scala stdlib filenames in `lib/`.** sbt-launch expects `scala-library.jar`, `scala-compiler.jar`, `scala-reflect.jar` *unversioned* under `<bootDir>/scala-<ver>/lib/` — that's how it names them when self-extracting from its own jar — plus the versioned `scala-xml_2.12-<v>.jar`. We materialize them by filename-mapping the versioned Coursier URLs from `bootJars`.
+- **`pkgs.sbt` is the wrong launcher for the sandbox.** It's bundled with one specific Scala bootstrap version and will try to fetch a different one over the network whenever `project/build.properties` points elsewhere. We lock and exec the matching `sbt-launch-<sbtVersion>.jar` directly. `pkgs.sbt` is fine at *lock* time, where there's a network.
+- **`-Dsbt.offline=true` matters.** Without it lm-coursier still reaches for the network at update time and chokes on the HTML error page with the baffling `SAXParseException: DOCTYPE is disallowed`. The real error underneath is `UnknownHostException`.
+- **`sbt update` resolves all configurations at once.** It's per-project, but asking for `app/package` still resolves `app`'s Test configuration. So the *build* cache needs each closure module's test dependencies too, even though nothing there compiles tests (`sbtModuleAllDeps`). The runtime *classpath*, by contrast, takes only the main scope — munit has no business on an app's classpath.
+- **`mkCacheDir` with an empty list produces no `$out`.** It emits one `mkdir`+`ln` per artifact, so an empty dependency list yields an empty builder and the derivation fails. Projects without plugins get no plugin cache layered in at all, rather than an empty one.
+- **Batch mode and colors come from JVM flags, not CLI flags.** `-no-colors` / `-batch` are understood by the `sbt` shell script, not by `sbt-launch.jar`. The equivalents are `-Dsbt.color=false`, `-Dsbt.supershell=false`, and closing stdin (`< /dev/null`).
+- **Inherited dependency versions** (shared with the scala-cli path). Many POMs declare `<dependency>` blocks with no `<version>`, inheriting it from an ancestor's `<dependencyManagement>`. `collectAccumulatedDependencyManagement` walks the parent chain building a `(g,a) → v` map and `collectDeclaredPoms` fills in the gaps. Needed to pick up `jackson-annotations:2.12.1.pom` for sbt's lm-coursier on Linux.
+
+#### Known limitations
+
+- Unmanaged (`lib/`) jars aren't locked.
+- Source generators that invoke external tools, or fetch at generation time, won't work in the sandbox. Self-contained ones (like `BuildInfoPlugin`) do.
+- `scn init` doesn't scaffold sbt projects yet — write `derivation.nix` by hand (see `examples/sbt-multi/derivation.nix`).
+- The toolchain derivations aren't reachable as flake outputs, so a public substituter only has them if some build that used them pushed them. Exposing them as packages would let CI cache them once across projects.
+
 ## Development
 
 ### Project structure
 
 ```
 flake.nix              # Flake: overlay, packages, checks
-lib.nix                # buildScalaCliApp / buildScalaCliApps Nix functions
+lib.nix                # buildScalaCliApp(s) / buildCoursierApp / buildSbtApp(s) Nix functions
 cli/
-  scala-cli-nix.scala  # CLI tool (init/lock), built by buildScalaCliApp
+  scala-cli-nix.scala  # CLI tool (init/lock/lock-sbt/lock-coords/dedup-cache), built by buildScalaCliApp
   derivation.nix       # Self-hosting derivation
   scala.lock.json      # CLI's own lockfile
 examples/
@@ -374,6 +491,8 @@ examples/
   metals/                         # buildCoursierApp from raw --dep coords (no contrib channel)
   scalafmt/                       # buildCoursierApp via the default coursier app channel
   smithy4s/                       # buildCoursierApp via the coursier contrib channel (--contrib, --scala-binary 2.13.12)
+  sbt/                            # buildSbtApp, single module: real sbt runs in the sandbox against the locked toolchain
+  sbt-multi/                      # buildSbtApp, multi-module: `app` dependsOn `core`, BuildInfoPlugin generates sources in-sandbox, `app/test` runs munit via passthru.tests
 ```
 
 Each `*-docker/` example is a thin `dockerTools.buildLayeredImage` derivation that takes the upstream app as a `callPackage` argument; no Scala source or lockfile of its own. They're wired into the root flake under `lib.optionalAttrs pkgs.stdenv.isLinux` (because `dockerTools` doesn't build on Darwin) so they at least build under `nix flake check` on aarch64-linux. The per-image VM tests (`docker-image-scala-native`, `docker-image-scala3-jvm`, `docker-image-scala3-native-image`, each built via the `mkDockerImageTest` helper) are further gated to `x86_64-linux` because `pkgs.testers.runNixOSTest` needs KVM of the matching arch, and that's the only Linux arch we count on for CI builders. Each VM test runs a NixOS guest with dockerd that loads one image and asserts the container's stdout — covering the full pattern from the README's Docker section.
@@ -433,6 +552,16 @@ nix run ..# -- lock .
 ```bash
 cd examples/scala3
 nix run ../..# -- lock
-# or, from devShell:
-scn lock
 ```
+
+For an sbt example, `lock-sbt` instead. It shells out to sbt, so go through the
+Nix-built CLI (which sets `SCALA_CLI_NIX_SBT`) rather than a bare `scn` on PATH:
+
+```bash
+cd examples/sbt-multi
+nix run ../..# -- lock-sbt
+```
+
+Note that `lock-sbt` compiles the project once (`Compile / mainClass` is a task,
+not a setting) and leaves sbt's `target/` dirs behind. They're gitignored, and
+the build-side source filter drops them, so there's nothing to clean up.

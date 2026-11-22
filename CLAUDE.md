@@ -13,17 +13,19 @@ Two phases: **lock** (outside Nix, with network) and **build** (inside Nix sandb
 - The CLI shells out to a `scala-cli` binary at lock time. It reads the path from `SCALA_CLI_NIX_SCALA_CLI` (set by the Nix wrapper to a kubukoz/scala-cli fork release) and falls back to `scala-cli` on PATH otherwise. The fork is internal: never on the user's PATH, never used inside the Nix sandbox.
 - `--library` (not `--standalone`) is intentional for JVM builds — it produces a tiny JAR with only user code. Dependencies stay as individual Nix store paths on the classpath.
 - Both JARs and POMs must be in the lockfile. POMs are needed for offline Coursier resolution but filtered out of the runtime classpath.
-- Lockfile version is **9** (checked in `lib.nix` as `supportedVersion`). Multi-target `targets` map (even for single-target projects). The shape is discriminated by a top-level `kind` field: `"scala-cli"` (default, project sources) or `"coursier-app"` (Coursier coordinates only).
-- `lib.nix` exposes: `buildScalaCliApp` (single derivation, requires `target` if multi-target), `buildScalaCliApps` (attrset for cross projects), `buildCoursierApp` (for `kind = "coursier-app"` lockfiles), and `collectChecks` (flattens `passthru.tests` into `checks.<system>`).
+- Lockfile version is **9** (checked in `lib.nix` as `supportedVersion`). Multi-target `targets` map (even for single-target projects). The shape is discriminated by a top-level `kind` field: `"scala-cli"` (default, project sources), `"coursier-app"` (Coursier coordinates only), or `"sbt"` (an sbt build; has a `modules` map instead of `targets`, plus an `sbt` toolchain block).
+- `lib.nix` exposes: `buildScalaCliApp` (single derivation, requires `target` if multi-target), `buildScalaCliApps` (attrset for cross projects), `buildCoursierApp` (for `kind = "coursier-app"` lockfiles), `buildSbtApp` / `buildSbtApps` (for `kind = "sbt"` lockfiles; `buildSbtApp` requires `module` if the lockfile has more than one), `mkCoursierCache`, and `collectChecks` (flattens `passthru.tests` into `checks.<system>`).
 - `--platform` and `--scala-version` are always passed to `scala-cli package` and `scala-cli export --json` to select the correct target from multi-platform sources. Platforms: JVM, Native, JS. JS targets are frontend-only (no node): the build links to `$out/share/<pname>.js`. JS *builds* run the Scala.js linker on the JVM from the offline cache (`--js-cli-on-jvm` + `--js-cli-version`), and use the bundled fork in-sandbox (`scalaCliJs` arg to `lib.nix`) because upstream scala-cli resolves the linker as a `<v>+` range that can't resolve offline.
-- CLI subcommands: `lock` (project sources), `lock-coords` (Coursier app channels or raw `--dep` coords), `init` (scaffold local) or `init <github-url>` (scaffold external build with `--src` semantics).
+- CLI subcommands: `lock` (project sources), `lock-sbt` (sbt projects), `lock-coords` (Coursier app channels or raw `--dep` coords), `init` (scaffold local) or `init <github-url>` (scaffold external build with `--src` semantics), `dedup-cache`.
+- The CLI also shells out to `sbt` on the `lock-sbt` path, read from `SCALA_CLI_NIX_SBT` (set by the Nix wrapper to `pkgs.sbt`), falling back to `sbt` on PATH. That's the *lock-time* launcher only — it has network access and bootstraps whatever `project/build.properties` names. Inside the sandbox the build execs the **locked** `sbt-launch.jar` instead, because nixpkgs' launcher is bound to its own embedded Scala bootstrap version.
 
 ## Commands
 
 ```bash
 nix flake check --print-build-logs   # Build + test all examples
-nix develop                          # Enter devShell with wrapped scala-cli + scn on PATH
-scn lock                             # Regenerate scala.lock.json (alias for scala-cli-nix lock)
+nix build .#default                  # Build the CLI (there is no devShell; `nix develop` only gives the CLI's build env)
+nix run .# -- lock                   # Regenerate scala.lock.json for the cwd project
+nix run .# -- lock-sbt               # Same, for an sbt project (needs SCALA_CLI_NIX_SBT, which the wrapper sets)
 nix build .#<example-name>           # Build a single example
 ```
 
