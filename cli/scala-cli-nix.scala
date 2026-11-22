@@ -98,8 +98,6 @@ case class CoursierAppLock(
     dependencies: List[ArtifactEntry]
 ) derives Codec.AsObject
 
-// --- JSON model (scala-cli export, only the fields we use) ---
-
 case class ExportArtifactId(fullName: String) derives Decoder
 
 case class ExportDependency(
@@ -692,14 +690,85 @@ def collectImportedBoms(
   * tuples for each <dependency> in the POM's <dependencies> section. Excludes
   * deps inside <dependencyManagement>. May include unresolved property
   * placeholders like ${project.version} — caller filters those out.
+  *
+  * A `<dependency>` with no `<version>` inherits it from an ancestor POM's
+  * `<dependencyManagement>`, which this function cannot see. Those are
+  * returned with the empty string as version; the caller resolves them via
+  * `collectAccumulatedDependencyManagement`.
   */
 def parseDeclaredDeps(pomContent: String): List[(String, String, String)] = {
   val root = loadPom(pomContent)
-  (root \ "dependencies" \ "dependency").toList.flatMap(parseGAV(_))
+  (root \ "dependencies" \ "dependency").toList.flatMap { dep =>
+    for {
+      g <- childText(dep, "groupId")
+      a <- childText(dep, "artifactId")
+    } yield (g, a, childText(dep, "version").getOrElse(""))
+  }
 }
 
 def extractDeclaredDeps(pomPath: Path): IO[List[(String, String, String)]] =
   readFile(pomPath).map(parseDeclaredDeps)
+
+/** `(groupId, artifactId) -> version` entries from a POM's own
+  * `<dependencyManagement>`, excluding `<scope>import</scope>` BOMs (those are
+  * handled by `parseImportedBoms` / `collectImportedBoms`).
+  */
+def parseDependencyManagement(
+    pomContent: String,
+    properties: Map[String, String] = Map.empty
+): Map[(String, String), String] = {
+  val root = loadPom(pomContent)
+  val entries = root \ "dependencyManagement" \ "dependencies" \ "dependency"
+  entries.toList.flatMap { dep =>
+    val isImport = childText(dep, "scope").contains("import")
+    if (isImport) Nil
+    else
+      parseGAV(dep).toList.flatMap { (g, a, v) =>
+        val resolved = substituteProperties(v, properties)
+        Option.when(!resolved.contains("$"))(((g, a), resolved))
+      }
+  }.toMap
+}
+
+/** Walk a POM's `<parent>` chain and merge every `<dependencyManagement>`
+  * section into one `(groupId, artifactId) -> version` map, descendants
+  * overriding ancestors.
+  *
+  * This exists because many POMs declare `<dependency>` blocks with no
+  * `<version>` — the version is inherited from an ancestor's
+  * `<dependencyManagement>`. Without this walk those deps are silently dropped
+  * from the lockfile and offline resolution later fails on them (the concrete
+  * case that forced it: `jackson-annotations:2.12.1.pom`, needed by sbt's
+  * lm-coursier on Linux).
+  *
+  * Imported BOMs are deliberately *not* expanded here; `collectImportedBoms`
+  * already walks those.
+  */
+def collectAccumulatedDependencyManagement(
+    pomPath: Path,
+    repoBase: String
+): IO[Map[(String, String), String]] = {
+  def loop(
+      current: Path,
+      acc: Map[(String, String), String]
+  ): IO[Map[(String, String), String]] =
+    readFile(current).flatMap { content =>
+      val props = parseProperties(content)
+      val own = parseDependencyManagement(content, props)
+      extractParent(current).flatMap {
+        case Some((g, a, v)) if repoBase.nonEmpty =>
+          val groupPath = g.replace('.', '/')
+          val parentUrl = s"$repoBase$groupPath/$a/$v/$a-$v.pom"
+          val parentPath = cachePathForUrl(parentUrl)
+          Files[IO].exists(parentPath).flatMap {
+            case true  => loop(parentPath, acc).map(_ ++ own)
+            case false => IO.pure(acc ++ own)
+          }
+        case _ => IO.pure(acc ++ own)
+      }
+    }
+  loop(pomPath, Map.empty)
+}
 
 /** Top-level POM version. Falls back to the parent's <version> when missing
   * (POM inherits the version from its parent).
@@ -736,36 +805,53 @@ def parseImportedBoms(
 }
 
 /** Walk all resolved POMs to find declared deps and fetch their JAR + POM
-  * individually. This captures evicted versions that scala-cli may try to fetch
-  * during offline resolution.
+  * individually. This captures evicted versions that scala-cli (or sbt's
+  * lm-coursier) may try to fetch during offline resolution.
   *
   * Each declared dep is fetched as its own resolution. Unlike
   * `withTransitive(false)` which fails on some artifacts in the Coursier
   * interface, this works reliably. Failures are tolerated (e.g. for
   * placeholder/marker artifacts).
+  *
+  * Deps declared without a `<version>` get theirs from the accumulated
+  * `<dependencyManagement>` of the POM and its ancestors; see
+  * `collectAccumulatedDependencyManagement`.
   */
 def collectDeclaredPoms(
     resolvedPomPaths: List[Path],
     resolvedUrls: Set[String]
 )(using HashCache, Repos): IO[List[ArtifactEntry]] =
-  resolvedPomPaths.flatTraverse(extractDeclaredDeps).flatMap { allDeclared =>
-    val candidates = allDeclared.distinct
-      .filterNot { (_, _, v) => v.contains("$") }
-      // Skip resolved winners (their JAR URL would already appear in resolvedUrls)
-      .filterNot { (g, a, v) =>
-        resolvedUrls.exists { u =>
-          u.contains(s"${g.replace('.', '/')}/$a/$v/")
+  resolvedPomPaths
+    .flatTraverse { pomPath =>
+      for {
+        content <- readFile(pomPath)
+        repoBase <- repoBaseForPom(pomPath, urlForCachePath(pomPath))
+        depMgmt <- collectAccumulatedDependencyManagement(pomPath, repoBase)
+        declared = parseDeclaredDeps(content)
+        withVersion = declared.flatMap { (g, a, v) =>
+          val resolved = if (v.isEmpty) depMgmt.get((g, a)) else Some(v)
+          resolved.map(rv => (g, a, rv))
+        }
+      } yield withVersion
+    }
+    .flatMap { allDeclared =>
+      val candidates = allDeclared.distinct
+        .filterNot { (_, _, v) => v.contains("$") }
+        // Skip resolved winners (their JAR URL would already appear in resolvedUrls)
+        .filterNot { (g, a, v) =>
+          resolvedUrls.exists { u =>
+            u.contains(s"${g.replace('.', '/')}/$a/$v/")
+          }
+        }
+
+      candidates.flatTraverse { (g, a, v) =>
+        val dep = Dependency.of(g, a, v)
+        fetchArtifacts(dep).attempt.flatMap {
+          case Right(arts) => collectEntriesNoRecurse(arts)
+          case Left(_)     => IO.pure(List.empty[ArtifactEntry])
         }
       }
-
-    candidates.flatTraverse { (g, a, v) =>
-      val dep = Dependency.of(g, a, v)
-      fetchArtifacts(dep).attempt.flatMap {
-        case Right(arts) => collectEntriesNoRecurse(arts)
-        case Left(_)     => IO.pure(List.empty[ArtifactEntry])
-      }
     }
-  }
 
 /** Like collectEntries but does not recursively walk declared deps (avoids
   * infinite loop).
@@ -998,6 +1084,7 @@ case class LockCoordsOptions(
     @Name("o")
     output: Option[String] = None
 )
+
 
 case class DedupCacheOptions(
     @HelpMessage("Apply changes without asking for confirmation.")

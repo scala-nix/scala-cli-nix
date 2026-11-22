@@ -114,7 +114,11 @@ class ParseDeclaredDepsTests extends munit.FunSuite {
     )
   }
 
-  test("dep missing version is dropped") {
+  test("dep missing version yields an empty version for the caller to resolve") {
+    // A <dependency> with no <version> inherits it from an ancestor POM's
+    // <dependencyManagement>. parseDeclaredDeps can't see that, so it reports
+    // v="" and collectDeclaredPoms fills it in via
+    // collectAccumulatedDependencyManagement.
     val pom = """<project><dependencies>
                 |  <dependency>
                 |    <groupId>a</groupId><artifactId>x</artifactId>
@@ -123,7 +127,7 @@ class ParseDeclaredDepsTests extends munit.FunSuite {
                 |    <groupId>b</groupId><artifactId>y</artifactId><version>2</version>
                 |  </dependency>
                 |</dependencies></project>""".stripMargin
-    assertEquals(parseDeclaredDeps(pom), List(("b", "y", "2")))
+    assertEquals(parseDeclaredDeps(pom), List(("a", "x", ""), ("b", "y", "2")))
   }
 
   test("property placeholders are returned verbatim (caller filters)") {
