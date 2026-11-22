@@ -3,3 +3,4 @@ known-users
 .direnv/
 .env.local
 .secrets/
+.scala-build/

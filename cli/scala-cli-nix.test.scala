@@ -908,3 +908,58 @@ class ParseGitHubUrlTests extends munit.FunSuite {
     assert(parseGitHubUrl("https://github.com/owner").isLeft)
   }
 }
+
+class TransitiveInternalDepsTests extends munit.FunSuite {
+  test("a module with no dependsOn has an empty closure") {
+    assertEquals(transitiveInternalDeps(Map("app" -> Nil), "app"), Nil)
+  }
+
+  test("direct dependencies are included") {
+    val direct = Map("app" -> List("core"), "core" -> Nil)
+    assertEquals(transitiveInternalDeps(direct, "app"), List("core"))
+  }
+
+  test("closure is transitive and sorted") {
+    val direct = Map(
+      "app" -> List("middle"),
+      "middle" -> List("core", "util"),
+      "core" -> Nil,
+      "util" -> Nil
+    )
+    assertEquals(
+      transitiveInternalDeps(direct, "app"),
+      List("core", "middle", "util")
+    )
+  }
+
+  test("a diamond reports each module once") {
+    val direct = Map(
+      "app" -> List("left", "right"),
+      "left" -> List("core"),
+      "right" -> List("core"),
+      "core" -> Nil
+    )
+    assertEquals(
+      transitiveInternalDeps(direct, "app"),
+      List("core", "left", "right")
+    )
+  }
+
+  test("the module itself is excluded even when reachable from itself") {
+    val direct = Map("app" -> List("core"), "core" -> List("app"))
+    assertEquals(transitiveInternalDeps(direct, "app"), List("core"))
+  }
+
+  test("a dependency cycle terminates instead of hanging") {
+    val direct = Map("a" -> List("b"), "b" -> List("c"), "c" -> List("b"))
+    assertEquals(transitiveInternalDeps(direct, "a"), List("b", "c"))
+  }
+
+  test("unknown dependsOn ids are tolerated") {
+    // sbt wouldn't produce this, but a hand-edited lockfile could.
+    assertEquals(
+      transitiveInternalDeps(Map("app" -> List("ghost")), "app"),
+      List("ghost")
+    )
+  }
+}

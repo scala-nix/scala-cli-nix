@@ -84,6 +84,14 @@
         # neither the sandboxed JVM/Native build (`lib.nix`) nor the user's PATH
         # sees the fork (the JS build path does use it — see `scalaCliJs`).
         #
+        # `lock-sbt` likewise shells out to `sbt`, passed via
+        # SCALA_CLI_NIX_SBT. That is only the *lock-time* launcher, which has
+        # network access and bootstraps whatever version
+        # `project/build.properties` names — nixpkgs' `sbt` is fine for that.
+        # The sbt that runs inside the sandbox is the locked `sbt-launch.jar`
+        # instead, because nixpkgs' launcher is bound to its own embedded Scala
+        # bootstrap version and reaches for the network on any other.
+        #
         # `scala-cli-nix-cli-native-image` is the same CLI built as a GraalVM
         # native image (no JVM at runtime). Slower to build, much faster to
         # start.
@@ -95,7 +103,8 @@
               nativeBuildInputs = [ final.makeWrapper ];
               postBuild = ''
                 wrapProgram $out/bin/scala-cli-nix \
-                  --set-default SCALA_CLI_NIX_SCALA_CLI ${forkScalaCli}/bin/scala-cli
+                  --set-default SCALA_CLI_NIX_SCALA_CLI ${forkScalaCli}/bin/scala-cli \
+                  --set-default SCALA_CLI_NIX_SBT ${final.sbt}/bin/sbt
                 ln -s scala-cli-nix $out/bin/scn
 
                 # zsh completion: nixpkgs auto-loads files under share/zsh/site-functions
@@ -162,6 +171,11 @@
           example-scala-test-scalatest = pkgs.callPackage ./examples/scala-test-scalatest/derivation.nix { };
           example-scala-test-ziotest = pkgs.callPackage ./examples/scala-test-ziotest/derivation.nix { };
 
+          # sbt-managed example (built by `buildSbtApp` — real sbt runs inside
+          # the sandbox against the locked toolchain; see `scn lock-sbt`).
+          example-sbt = pkgs.callPackage ./examples/sbt/derivation.nix { };
+          example-sbt-multi = pkgs.callPackage ./examples/sbt-multi/derivation.nix { };
+
           # Coursier-app examples (built by `buildCoursierApp` — no scala-cli
           # at build time). `metals` was locked from raw `--dep` coords;
           # `scalafmt` was locked via the default channel
@@ -208,6 +222,11 @@
           example-scala-resources-native = mkOutputCheck { name = "example-scala-resources-native"; pkg = example-scala-resources.native; binName = "example-scala-resources"; expected = "hello from embedded resource!"; };
           example-scala3-native-image = mkOutputCheck { name = "example-scala3-native-image"; pkg = example-scala3-native-image; expected = "hello from graalvm native image!"; };
           example-scala3-assembly = mkOutputCheck { name = "example-scala3-assembly"; pkg = example-scala3-assembly; expected = "hello from assembly!"; };
+          example-sbt = mkOutputCheck { name = "example-sbt"; pkg = example-sbt; expected = "hello from sbt!"; };
+          # Multi-module sbt: `app` dependsOn `core`, BuildInfoPlugin generates
+          # sources inside the sandbox, and the test scope runs `app/test`.
+          example-sbt-multi = mkOutputCheck { name = "example-sbt-multi"; pkg = example-sbt-multi; expected = "hello from sbt multi-module (example-sbt-multi-app 0.1.0)"; };
+          example-sbt-multi-test = example-sbt-multi.passthru.tests.test;
           # Regression: scala-java-time transitively pulls
           # portable-scala-reflect_native0.5_2.13, which pins scalalib_native0.5_2.13
           # to 2.13.8+0.5.2. scala-cli's combined resolution at build time picks
