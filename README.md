@@ -108,6 +108,77 @@ scala-cli-nix.buildCoursierApp {
 
 The result is a small shell wrapper at `$out/bin/<pname>` that runs `java -cp ... <mainClass>`. No scala-cli compile step, no Coursier cache layout — just `pkgs.fetchurl` per JAR and a wrapper script.
 
+## sbt projects
+
+Projects built by sbt rather than scala-cli use `lock-sbt` and `buildSbtApp`. The approach differs from the other paths: instead of driving the compiler ourselves, **real sbt runs inside the Nix sandbox**, on the version your `project/build.properties` names, against a locked offline installation of sbt itself.
+
+```bash
+cd my-sbt-project
+scn lock-sbt
+```
+
+This asks sbt what the build looks like — modules, Scala versions, main classes, sources, dependencies, plugins — and writes a `scala.lock.json` with `kind = "sbt"`. Note that it compiles the project once, since sbt's `Compile / mainClass` is a task rather than a setting.
+
+Both sbt 1 and sbt 2 are supported (verified against 1.10.7 and 2.1.0).
+
+On the Nix side:
+
+```nix
+{ scala-cli-nix }:
+
+scala-cli-nix.buildSbtApp {
+  pname = "my-app";
+  version = "0.1.0";
+  src = ./.;
+  lockFile = ./scala.lock.json;
+}
+```
+
+### Multi-module builds
+
+Each sbt subproject is locked separately. Pass `module` to pick which one to build:
+
+```nix
+scala-cli-nix.buildSbtApp {
+  pname = "my-app";
+  version = "0.1.0";
+  src = ./.;
+  module = "app";        # an sbt project id
+  lockFile = ./scala.lock.json;
+}
+```
+
+The build packages `app` *and* every module it `dependsOn`, transitively, and puts all of their jars on the runtime classpath. `module` may be omitted only when the lockfile has exactly one module — and note that sbt synthesizes an aggregate root project for builds whose `build.sbt` doesn't define one, so a two-module build usually locks as three.
+
+`buildSbtApps` builds every module that has a main class, returning an attrset keyed by project id:
+
+```nix
+# Returns: { app = <derivation>; cli = <derivation>; }
+scala-cli-nix.buildSbtApps { pname = "my-app"; version = "0.1.0"; src = ./.; lockFile = ./scala.lock.json; }
+```
+
+### Tests
+
+A module's test scope is exposed as `passthru.tests.test` and runs `<module>/test` offline in the sandbox, so `collectChecks` picks it up alongside the scala-cli examples:
+
+```nix
+checks.${system} = scala-cli-nix.collectChecks self.packages.${system};
+```
+
+### Plugins
+
+`project/plugins.sbt` is locked too: plugin coordinates are read from the meta-build and resolved transitively, so plugins work in the sandbox. Source-generating plugins run there as well — `examples/sbt-multi` uses `sbt-buildinfo`, whose generated sources are compiled inside the sandbox like any other.
+
+### Caching
+
+The sbt installation is split out into two derivations keyed only on `(sbtVersion, scalaBootVersion)` and the locked sbt-side artifact hashes. Nothing project-specific goes into them, so two projects on the same sbt and Scala versions share the exact same store paths, and editing your own source code never rebuilds them.
+
+### Limitations
+
+- Unmanaged (`lib/`) jars aren't locked.
+- Source generators that call external tools or fetch at generation time won't work in the sandbox; self-contained ones do.
+- `scn init` doesn't scaffold sbt projects yet — write `derivation.nix` by hand.
+
 ## GraalVM native image
 
 JVM targets can be built as a single statically-linkable binary via GraalVM native-image. Pass `nativeImage = true`:

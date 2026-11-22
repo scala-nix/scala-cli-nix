@@ -114,7 +114,11 @@ class ParseDeclaredDepsTests extends munit.FunSuite {
     )
   }
 
-  test("dep missing version is dropped") {
+  test("dep missing version yields an empty version for the caller to resolve") {
+    // A <dependency> with no <version> inherits it from an ancestor POM's
+    // <dependencyManagement>. parseDeclaredDeps can't see that, so it reports
+    // v="" and collectDeclaredPoms fills it in via
+    // collectAccumulatedDependencyManagement.
     val pom = """<project><dependencies>
                 |  <dependency>
                 |    <groupId>a</groupId><artifactId>x</artifactId>
@@ -123,7 +127,7 @@ class ParseDeclaredDepsTests extends munit.FunSuite {
                 |    <groupId>b</groupId><artifactId>y</artifactId><version>2</version>
                 |  </dependency>
                 |</dependencies></project>""".stripMargin
-    assertEquals(parseDeclaredDeps(pom), List(("b", "y", "2")))
+    assertEquals(parseDeclaredDeps(pom), List(("a", "x", ""), ("b", "y", "2")))
   }
 
   test("property placeholders are returned verbatim (caller filters)") {
@@ -902,5 +906,60 @@ class ParseGitHubUrlTests extends munit.FunSuite {
 
   test("missing repo segment is rejected") {
     assert(parseGitHubUrl("https://github.com/owner").isLeft)
+  }
+}
+
+class TransitiveInternalDepsTests extends munit.FunSuite {
+  test("a module with no dependsOn has an empty closure") {
+    assertEquals(transitiveInternalDeps(Map("app" -> Nil), "app"), Nil)
+  }
+
+  test("direct dependencies are included") {
+    val direct = Map("app" -> List("core"), "core" -> Nil)
+    assertEquals(transitiveInternalDeps(direct, "app"), List("core"))
+  }
+
+  test("closure is transitive and sorted") {
+    val direct = Map(
+      "app" -> List("middle"),
+      "middle" -> List("core", "util"),
+      "core" -> Nil,
+      "util" -> Nil
+    )
+    assertEquals(
+      transitiveInternalDeps(direct, "app"),
+      List("core", "middle", "util")
+    )
+  }
+
+  test("a diamond reports each module once") {
+    val direct = Map(
+      "app" -> List("left", "right"),
+      "left" -> List("core"),
+      "right" -> List("core"),
+      "core" -> Nil
+    )
+    assertEquals(
+      transitiveInternalDeps(direct, "app"),
+      List("core", "left", "right")
+    )
+  }
+
+  test("the module itself is excluded even when reachable from itself") {
+    val direct = Map("app" -> List("core"), "core" -> List("app"))
+    assertEquals(transitiveInternalDeps(direct, "app"), List("core"))
+  }
+
+  test("a dependency cycle terminates instead of hanging") {
+    val direct = Map("a" -> List("b"), "b" -> List("c"), "c" -> List("b"))
+    assertEquals(transitiveInternalDeps(direct, "a"), List("b", "c"))
+  }
+
+  test("unknown dependsOn ids are tolerated") {
+    // sbt wouldn't produce this, but a hand-edited lockfile could.
+    assertEquals(
+      transitiveInternalDeps(Map("app" -> List("ghost")), "app"),
+      List("ghost")
+    )
   }
 }

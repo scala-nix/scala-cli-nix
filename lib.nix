@@ -28,7 +28,7 @@ let
       kind = json.kind or "scala-cli";
       kindCheck =
         if kind != "scala-cli"
-        then builtins.throw "scala-cli-nix: buildScalaCliApp(s) expects a scala-cli lockfile (kind = \"scala-cli\") but got kind = \"${kind}\". Use buildCoursierApp for coursier-app lockfiles."
+        then builtins.throw "scala-cli-nix: buildScalaCliApp(s) expects a scala-cli lockfile (kind = \"scala-cli\") but got kind = \"${kind}\". Use buildCoursierApp for coursier-app lockfiles, or buildSbtApp for sbt lockfiles."
         else true;
       native = target: target.native or null;
       js = target: target.js or null;
@@ -478,6 +478,291 @@ let
     then buildJvmAssemblyApp { inherit pname version src sources resourceDirs mainClass attrOverrides; fetched = targetFetched; }
     else buildJvmApp { inherit pname version src sources resourceDirs mainClass attrOverrides; fetched = targetFetched; };
 
+  # --- sbt support -----------------------------------------------------------
+  #
+  # Unlike the scala-cli path (where we drive the compiler ourselves), sbt
+  # projects are built by running *real sbt* inside the sandbox: reimplementing
+  # an sbt build definition is not tractable. That means the sandbox needs a
+  # complete, offline sbt installation. `scn lock-sbt` records it; the helpers
+  # below materialize it.
+
+  # Filter `src` down to what sbt needs to load the build and compile the
+  # listed sources: every root-level `*.sbt`, the whole `project/` tree (the
+  # meta-build, where plugins live), the locked source files, and any resource
+  # directories. Build output dirs (`target/`) are dropped — they are the
+  # sandbox's to create, and including a stale local one would both poison the
+  # derivation hash and let sbt mistake prebuilt classes for fresh ones.
+  prepareSbtSources = sources: resourceDirs: src:
+    let
+      isTargetPath = rel:
+        rel == "target" || lib.hasSuffix "/target" rel || lib.hasInfix "/target/" rel;
+      insideResourceDir = rel:
+        builtins.any (r: rel == r || lib.hasPrefix (r + "/") rel) resourceDirs;
+      ancestorOfResourceDir = rel:
+        builtins.any (r: lib.hasPrefix (rel + "/") r) resourceDirs;
+      ancestorOfSource = rel:
+        builtins.any (s: lib.hasPrefix (rel + "/") s) sources;
+      # sbt reads `*.sbt` from the build root and from `project/`, nowhere
+      # else — a stray `foo/bar.sbt` inside a module is not part of the build
+      # definition, so it has no reason to enter the source tree.
+      isRootSbtFile = rel:
+        lib.hasSuffix ".sbt" rel && !(lib.hasInfix "/" rel);
+    in lib.cleanSourceWith {
+      inherit src;
+      filter = path: type:
+        let rel = lib.removePrefix (toString src + "/") (toString path);
+        in if isTargetPath rel then false
+          else if type == "directory"
+          then rel == "project"
+            || lib.hasPrefix "project/" rel
+            || ancestorOfSource rel
+            || insideResourceDir rel
+            || ancestorOfResourceDir rel
+          else isRootSbtFile rel
+            || lib.hasPrefix "project/" rel
+            || builtins.elem rel sources
+            || insideResourceDir rel;
+    };
+
+  # Reproduce sbt's boot directory exactly as the launcher laid it out. Each
+  # entry carries the path the launcher wants (`scala-<v>/lib/scala-library.jar`,
+  # `scala-<v>/org.scala-sbt/sbt/<ver>/main_3-<ver>.jar`, ...) and the artifact
+  # supplying those bytes; `scn lock-sbt` recorded the pairing by content hash.
+  #
+  # Nothing here derives a filename from a coordinate, and deliberately so. The
+  # launcher renames files on the way in, and the two sbt generations disagree
+  # about how — sbt 1's `lib/` has unversioned scala-compiler/library/reflect,
+  # sbt 2's has versioned Scala 3 names plus an unversioned scala-library.jar.
+  # Guessing it wrong is not a clean failure either: the launcher reports
+  # sbt#4955 ("unable to detect the Scala version for org.scala-sbt:sbt"),
+  # which reads as a resolution problem and isn't one.
+  #
+  # Only resolved winners are in `bootFiles`, because that is all the launcher
+  # itself keeps — an evicted or duplicate-artifactId jar in the boot directory
+  # is what genuinely does provoke sbt#4955.
+  mkSbtBootDir = name: bootFiles:
+    let
+      # `entry.dep.path` is the boot-relative path from the lockfile;
+      # `entry.path` is the fetched store path. (`fetchAll` keeps the lockfile
+      # object under `dep`, which is why both are called "path".)
+      linkCommands = builtins.map (entry: ''
+        mkdir -p $out/$(dirname "${entry.dep.path}")
+        ln -sf ${entry.path} $out/${entry.dep.path}
+      '') bootFiles;
+    in runCommand name {} (builtins.concatStringsSep "\n" linkCommands);
+  # Project-independent sbt environment: launcher jar + boot dir + a Coursier
+  # cache prepopulated with everything sbt needs to bootstrap itself (the boot
+  # transitive set including evicted POMs, the scalaInstance, and the compiler
+  # bridge). The project's own dependencies and plugins are layered on top at
+  # build time rather than merged in here, so that two projects sharing an sbt
+  # version + Scala version + locked artifact set share these exact store
+  # paths. The cache key deliberately excludes everything project-specific.
+  mkSbtToolchain = sbtBlock:
+    let
+      key = "${sbtBlock.sbtVersion}-${sbtBlock.scalaBootVersion}";
+    in {
+      launcherJar = sbtBlock.launcherJar.path;
+      inherit (sbtBlock) sbtVersion scalaBootVersion;
+      bootDir = mkSbtBootDir "sbt-boot-${key}" sbtBlock.bootFiles;
+      coursierCache = mkCacheDir "sbt-coursier-${key}"
+        (sbtBlock.bootCoursierCache ++ sbtBlock.scalaInstance ++ sbtBlock.compilerBridge);
+    };
+
+  # sbt's JVM-level flags. The boot/global/ivy dirs and COURSIER_CACHE are
+  # redirected at the writable copies made during setup, and
+  # `-Dsbt.offline=true` stops lm-coursier from reaching for the network at
+  # update time (without it the failure surfaces as a baffling
+  # `SAXParseException: DOCTYPE is disallowed` — sbt parsing an HTTP error page
+  # — rather than the underlying UnknownHostException).
+  #
+  # `-Dsbt.color=false` and `-Dsbt.supershell=false` stand in for the `sbt`
+  # shell script's `-no-colors`; the launcher jar itself does not accept those
+  # flags. Batch mode likewise comes from closing stdin at the call site rather
+  # than from `-batch`.
+  sbtLauncherOpts = lib.concatStringsSep " " [
+    "-Xmx2G"
+    "-Dsbt.global.base=$SBT_SBTBOOT"
+    "-Dsbt.boot.directory=$SBT_BOOT"
+    "-Dsbt.ivy.home=$SBT_IVY"
+    "-Dsbt.offline=true"
+    "-Dsbt.supershell=false"
+    "-Dsbt.color=false"
+  ];
+
+  # Materialize writable copies of the read-only toolchain. sbt writes into
+  # both the boot dir and the Coursier cache (compiled compiler bridge,
+  # internal lockfiles), so the FOD paths can't be used in place. `cp -rs`
+  # populates the copies with symlinks back into the store, so this costs
+  # directory entries rather than a full artifact copy.
+  mkSbtEnvSetup = toolchain: extraCaches: ''
+    export SBT_HOME=$TMPDIR/sbt-home
+    export SBT_BOOT=$SBT_HOME/boot
+    export SBT_SBTBOOT=$SBT_HOME/sbtboot
+    export SBT_IVY=$SBT_HOME/ivy
+    export COURSIER_CACHE=$SBT_HOME/coursier
+    mkdir -p $SBT_BOOT $SBT_SBTBOOT $SBT_IVY $COURSIER_CACHE
+
+    cp -rs --no-preserve=mode ${toolchain.bootDir}/. $SBT_BOOT/
+    cp -rs --no-preserve=mode ${toolchain.coursierCache}/. $COURSIER_CACHE/
+  '' + lib.concatMapStrings (cache: ''
+    cp -rs --no-preserve=mode ${cache}/. $COURSIER_CACHE/
+  '') extraCaches + ''
+    # sbt otherwise tries to write to $HOME/.sbt, and the sandbox's HOME is
+    # /homeless-shelter (Linux) or /var/empty (Darwin) — neither writable.
+    export HOME=$TMPDIR/home
+    mkdir -p $HOME
+  '';
+
+  # The modules that have to be packaged to run `module`: itself plus the
+  # transitive closure of sbt projects it `dependsOn`. Each contributes a jar;
+  # nothing else carries their compiled classes.
+  sbtBuildClosure = loaded: module:
+    let
+      moduleLock = loaded.modules.${module} or
+        (builtins.throw "scala-cli-nix: lockfile has no sbt module \"${module}\" (have: ${builtins.concatStringsSep ", " (builtins.attrNames loaded.modules)}). Re-run `scn lock-sbt` if the build changed.");
+    in [ module ] ++ moduleLock.internalDependencies;
+
+  # Everything a module's `update` will try to resolve. sbt resolves all of a
+  # project's configurations in one go, so the test scope counts even when only
+  # the main scope is being built.
+  sbtModuleAllDeps = moduleLock:
+    moduleLock.libraryDependencies ++
+    (if moduleLock.test != null then moduleLock.test.libraryDependencies else []);
+
+  # JAR-only entries. POMs are in the lockfile for offline resolution and must
+  # never land on a runtime classpath.
+  jarEntries = entries:
+    builtins.filter (e: builtins.match ".*\\.jar" e.dep.url != null) entries;
+
+  buildSbtTest = { pname, version, src, sources, resourceDirs, loaded, module, attrOverrides }:
+    let
+      moduleLock = loaded.modules.${module};
+      toolchain = mkSbtToolchain loaded.sbt;
+      closure = sbtBuildClosure loaded module;
+      # Every configuration of every module in the closure: the test scope
+      # compiles against the main scope, and sbt's `update` resolves all of a
+      # project's configurations together regardless of which one is asked for.
+      closureCacheDeps = builtins.concatLists
+        (builtins.map (m: sbtModuleAllDeps loaded.modules.${m}) closure);
+      depsCache = mkCacheDir "sbt-test-deps-${pname}-${module}" closureCacheDeps;
+      # `mkCacheDir` emits one mkdir+ln per artifact, so an empty dep list
+      # yields an empty builder that never creates $out. Projects without
+      # plugins simply get no plugin cache layered in.
+      pluginCaches = lib.optional (loaded.pluginDependencies != [])
+        (mkCacheDir "sbt-plugins-${pname}" loaded.pluginDependencies);
+      # Only this module's test sources are added: `<module>/test` compiles its
+      # own Test config against the *Compile* config of the modules it depends
+      # on, never their Test configs.
+      filteredSrc = prepareSbtSources
+        (sources ++ moduleLock.test.sources)
+        (resourceDirs ++ moduleLock.test.resourceDirs)
+        src;
+    in stdenv.mkDerivation (attrOverrides ({
+      pname = "${pname}-${module}-test";
+      inherit version;
+      dontUnpack = true;
+      buildInputs = [ openjdk ];
+      # Run from a writable copy of the project tree: sbt writes into
+      # `target/`, and tests that read cwd-relative files resolve the same way
+      # they do in a normal checkout.
+      buildPhase = mkSbtEnvSetup toolchain ([ depsCache ] ++ pluginCaches) + ''
+        cp -r ${filteredSrc} $TMPDIR/proj
+        chmod -R u+w $TMPDIR/proj
+        cd $TMPDIR/proj
+        java ${sbtLauncherOpts} -jar ${toolchain.launcherJar} \
+          ${module}/test < /dev/null
+      '';
+      installPhase = ''
+        mkdir -p $out
+        touch $out/passed
+      '';
+    }) "JVM");
+
+  mkSbtTests = { pname, version, src, sources, resourceDirs, loaded, module, attrOverrides }:
+    if loaded.modules.${module}.test == null then {}
+    else { test = buildSbtTest { inherit pname version src sources resourceDirs loaded module attrOverrides; }; };
+
+  buildSbtAppImpl = { pname, version, src, sources, resourceDirs, loaded, module, attrOverrides }:
+    let
+      moduleLock = loaded.modules.${module};
+      toolchain = mkSbtToolchain loaded.sbt;
+      closure = sbtBuildClosure loaded module;
+
+      # Union of the closure's dependencies. `update` is per-project but
+      # resolves *every* configuration of that project at once, so asking for
+      # `app/package` still resolves `app`'s Test configuration — the cache
+      # needs the test dependencies even though nothing here compiles tests.
+      closureCacheDeps = builtins.concatLists
+        (builtins.map (m: sbtModuleAllDeps loaded.modules.${m}) closure);
+      userDepsCache = mkCacheDir "sbt-deps-${pname}-${module}" closureCacheDeps;
+      # The runtime classpath, by contrast, takes only the main scope: munit
+      # has no business on the app's classpath.
+      closureRuntimeDeps = builtins.concatLists
+        (builtins.map (m: loaded.modules.${m}.libraryDependencies) closure);
+      # `mkCacheDir` emits one mkdir+ln per artifact, so an empty dep list
+      # yields an empty builder that never creates $out. Projects without
+      # plugins simply get no plugin cache layered in.
+      pluginCaches = lib.optional (loaded.pluginDependencies != [])
+        (mkCacheDir "sbt-plugins-${pname}" loaded.pluginDependencies);
+
+      filteredSrc = prepareSbtSources sources resourceDirs src;
+
+      # `<id>/package` for every module in the closure, in one sbt invocation.
+      # sbt works out the build order itself.
+      packageTargets = builtins.concatStringsSep " "
+        (builtins.map (m: "${m}/package") closure);
+
+      # Each closure module's jar lands at a predictable name under
+      # $out/share/<pname>/, and all of them go on the runtime classpath.
+      installJarCommands = builtins.map (m:
+        let packageBin = loaded.modules.${m}.packageBin;
+        in if packageBin == ""
+          then builtins.throw "scala-cli-nix: sbt module \"${m}\" has no packageBin path in the lockfile — its base directory is probably outside the build root, which the sandbox can't reproduce."
+          else ''cp "${packageBin}" $out/share/${pname}/${m}.jar''
+      ) closure;
+      moduleJarPaths = builtins.map (m: "$out/share/${pname}/${m}.jar") closure;
+      # Deduplicated: two modules in the closure commonly resolve the same
+      # library, and listing a jar twice on the classpath is just noise.
+      libraryClasspath = lib.unique
+        (builtins.map (e: e.path) (jarEntries closureRuntimeDeps));
+      classpath = builtins.concatStringsSep ":" (libraryClasspath ++ moduleJarPaths);
+
+      mainClass =
+        if moduleLock.mainClass != null
+        then moduleLock.mainClass
+        else builtins.throw "scala-cli-nix: sbt module \"${module}\" has no main class, so it can't be built as an app. Set `Compile / mainClass := Some(\"...\")` for it in build.sbt and re-run `scn lock-sbt`.";
+    in stdenv.mkDerivation (attrOverrides ({
+      inherit pname version;
+      src = filteredSrc;
+      buildInputs = [ openjdk makeWrapper ];
+      meta.mainProgram = pname;
+      passthru.tests = mkSbtTests {
+        inherit pname version src sources resourceDirs loaded module attrOverrides;
+      };
+
+      configurePhase = ''
+        runHook preConfigure
+        ${mkSbtEnvSetup toolchain ([ userDepsCache ] ++ pluginCaches)}
+        runHook postConfigure
+      '';
+
+      buildPhase = ''
+        runHook preBuild
+        java ${sbtLauncherOpts} -jar ${toolchain.launcherJar} \
+          ${packageTargets} < /dev/null
+        runHook postBuild
+      '';
+
+      installPhase = ''
+        runHook preInstall
+        mkdir -p $out/share/${pname} $out/bin
+        ${builtins.concatStringsSep "\n        " installJarCommands}
+        makeWrapper ${openjdk}/bin/java $out/bin/${pname} \
+          --add-flags "-cp ${classpath} ${mainClass}"
+        runHook postInstall
+      '';
+    }) "JVM");
+
   # Normalize dots to underscores for Nix attribute name ergonomics
   nixKey = key: builtins.replaceStrings [ "." ] [ "_" ] key;
 
@@ -500,6 +785,50 @@ let
       dependencies = fetchAll (json.dependencies or []);
     };
 
+  # Load a `kind = "sbt"` lockfile. The shape differs from the scala-cli one:
+  # there is no `targets` map (an sbt build picks its own platform and Scala
+  # version from build.sbt), a `modules` map takes its place, and a top-level
+  # `sbt` block carries the toolchain needed to run real sbt offline.
+  loadSbtLock = lockFile:
+    let
+      json = builtins.fromJSON (builtins.readFile lockFile);
+      versionCheck = checkLockVersion (json.version or null);
+      kind = json.kind or "scala-cli";
+      kindCheck =
+        if kind != "sbt"
+        then builtins.throw "scala-cli-nix: buildSbtApp(s) expects an sbt lockfile (kind = \"sbt\") but got kind = \"${kind}\". Did you mean buildScalaCliApp?"
+        else true;
+      sbtJson = json.sbt;
+    in assert versionCheck; assert kindCheck; {
+      sources = json.sources or [];
+      resourceDirs = json.resourceDirs or [];
+      pluginDependencies = fetchAll (json.pluginDependencies or []);
+      modules = builtins.mapAttrs (name: module:
+        let t = module.test or null;
+        in {
+          inherit (module) scalaVersion packageBin;
+          mainClass = module.mainClass or null;
+          internalDependencies = module.internalDependencies or [];
+          libraryDependencies = fetchAll module.libraryDependencies;
+          test =
+            if t != null
+            then {
+              inherit (t) sources;
+              resourceDirs = t.resourceDirs or [];
+              libraryDependencies = fetchAll t.libraryDependencies;
+            }
+            else null;
+        }
+      ) json.modules;
+      sbt = {
+        inherit (sbtJson) sbtVersion scalaBootVersion;
+        launcherJar = builtins.head (fetchAll [ sbtJson.launcherJar ]);
+        bootFiles = fetchAll sbtJson.bootFiles;
+        bootCoursierCache = fetchAll sbtJson.bootCoursierCache;
+        scalaInstance = fetchAll sbtJson.scalaInstance;
+        compilerBridge = fetchAll sbtJson.compilerBridge;
+      };
+    };
 in {
   # Build an offline Coursier cache from `{ url, sha256 }` entries. See the
   # definition above for the rationale (runtime dependency resolution offline).
@@ -610,4 +939,58 @@ in {
         chmod +x $out/bin/${pname}
       '';
     };
+
+  # Build one sbt module as an app, by running real sbt inside the Nix sandbox.
+  # Requires a `kind = "sbt"` lockfile produced by `scn lock-sbt`.
+  #
+  # `module` names an sbt project id. It may be omitted only when the lockfile
+  # has exactly one module — note that sbt synthesizes an aggregate root
+  # project for builds whose `build.sbt` doesn't define one, so a two-module
+  # build usually locks as three modules and needs `module` passed explicitly.
+  #
+  # The module's test scope, if it has one, is exposed as `passthru.tests.test`
+  # and so is picked up by `collectChecks`.
+  buildSbtApp = { pname, version, src, lockFile, module ? null, attrOverrides ? (attrs: _platform: attrs) }:
+    let
+      loaded = loadSbtLock lockFile;
+      moduleNames = builtins.attrNames loaded.modules;
+      resolvedModule =
+        if module != null
+        then module
+        else if builtins.length moduleNames == 1
+        then builtins.head moduleNames
+        else builtins.throw "scala-cli-nix: lockfile has multiple sbt modules (${builtins.concatStringsSep ", " moduleNames}). Pass `module` to buildSbtApp or use buildSbtApps.";
+    in buildSbtAppImpl {
+      inherit pname version src loaded attrOverrides;
+      module = resolvedModule;
+      sources = loaded.sources;
+      resourceDirs = loaded.resourceDirs;
+    };
+
+  # Build every runnable sbt module from a lockfile, returning an attrset keyed
+  # by sbt project id (dots normalized to underscores).
+  #
+  # Only modules with a main class are included: a library module and sbt's
+  # synthesized aggregate root have nothing to run, and emitting entries that
+  # throw on evaluation would break `nix flake check` for the whole flake.
+  # Build a library module deliberately — if you need its jar on its own — by
+  # naming it via `buildSbtApp`'s `module`.
+  buildSbtApps = { pname, version, src, lockFile, attrOverrides ? (attrs: _platform: attrs) }:
+    let
+      loaded = loadSbtLock lockFile;
+      runnable = builtins.filter
+        (m: loaded.modules.${m}.mainClass != null)
+        (builtins.attrNames loaded.modules);
+    in builtins.listToAttrs (
+      builtins.map (m:
+        { name = nixKey m;
+          value = buildSbtAppImpl {
+            inherit pname version src loaded attrOverrides;
+            module = m;
+            sources = loaded.sources;
+            resourceDirs = loaded.resourceDirs;
+          };
+        }
+      ) runnable
+    );
 }

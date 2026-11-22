@@ -98,7 +98,119 @@ case class CoursierAppLock(
     dependencies: List[ArtifactEntry]
 ) derives Codec.AsObject
 
-// --- JSON model (scala-cli export, only the fields we use) ---
+/** Test scope of one sbt module. Separate from the module's main scope because
+  * the test sources only need to enter the filtered source tree for the test
+  * derivation, and the test-only dependencies only need to be in the Coursier
+  * cache there.
+  */
+case class SbtTestLock(
+    sources: List[String],
+    resourceDirs: List[String],
+    libraryDependencies: List[ArtifactEntry]
+) derives Codec.AsObject
+
+/** One sbt subproject. Even a single-project build gets exactly one entry here
+  * (keyed by its sbt project id), mirroring how the scala-cli path always uses
+  * a `targets` map.
+  *
+  * `packageBin` is `Compile / packageBin / artifactPath` relative to the build
+  * root. Taking it from sbt rather than globbing `target/scala-*` after the
+  * fact is what makes multi-module builds work: each module's jar is named
+  * exactly, so we can collect several without ambiguity.
+  *
+  * `internalDependencies` is the *transitive* closure of sbt projects this one
+  * `dependsOn`, excluding itself. Those modules have to be packaged too — only
+  * their jars carry their compiled classes — and they go on the runtime
+  * classpath alongside this module's own.
+  */
+case class SbtModuleLock(
+    scalaVersion: String,
+    mainClass: Option[String],
+    packageBin: String,
+    internalDependencies: List[String],
+    libraryDependencies: List[ArtifactEntry],
+    test: Option[SbtTestLock]
+) derives Codec.AsObject
+
+/** One file in sbt's boot directory: where the launcher wants it (`path`,
+  * relative to the boot root) and which Maven artifact supplies those bytes.
+  *
+  * The indirection exists because the launcher does not lay its boot directory
+  * out the way Maven names things, and the two sbt generations disagree about
+  * how: sbt 1's `lib/` holds *unversioned* `scala-compiler.jar`,
+  * `scala-library.jar` and `scala-reflect.jar` next to a versioned
+  * `scala-xml_2.12-<v>.jar`, while sbt 2's holds versioned Scala 3 names
+  * (`scala3-compiler_3-<v>.jar`, `tasty-core_3-<v>.jar`, ...) next to an
+  * unversioned `scala-library.jar`. Reconstructing either from coordinates is
+  * guesswork, so `lock-sbt` asks the launcher for its actual file list and
+  * recovers each file's origin by matching content hashes against the resolved
+  * artifacts.
+  */
+case class SbtBootFile(path: String, url: String, sha256: String)
+    derives Codec.AsObject
+
+/** Toolchain half of an sbt lockfile: everything needed to run real sbt
+  * offline inside the Nix sandbox. Deliberately carries nothing
+  * project-specific, so that two projects on the same sbt + Scala versions
+  * share these exact Nix store paths.
+  *
+  * Two distinct groupings, and the split matters:
+  *   - `bootFiles`: exactly the files the launcher keeps in its boot
+  *     directory, at exactly the paths it keeps them. Only resolved winners
+  *     end up here — a single evicted or duplicate-artifactId jar in that
+  *     directory makes sbt-launch die with sbt#4955.
+  *   - `bootCoursierCache`: the *full* transitive set of the
+  *     `org.scala-sbt:sbt:<sbtVersion>` resolution (JARs + POMs, including
+  *     parent POMs, imported BOMs and evicted versions). This populates
+  *     COURSIER_CACHE so sbt's own resolution succeeds offline at update time.
+  *     It also covers the meta-build: `project/` is compiled by sbt's own
+  *     Scala toolchain, whose compiler and compiler bridge fall out of this
+  *     same resolution.
+  *
+  * `scalaInstance` and `compilerBridge` are full transitive sets with their
+  * POMs, unioned across every distinct Scala version used by the build's
+  * modules *and* sbt's own `scalaBootVersion` — so a build whose modules
+  * disagree on `scalaVersion`, or disagree with sbt's own Scala, still
+  * resolves offline.
+  *
+  * `launcherJar` is `org.scala-sbt:sbt-launch:<sbtVersion>`, which we exec
+  * directly: nixpkgs' `sbt` is bundled with one specific Scala bootstrap
+  * version and reaches for the network whenever a project's `sbt.version`
+  * points elsewhere.
+  */
+case class SbtToolchainLock(
+    sbtVersion: String,
+    scalaBootVersion: String,
+    launcherJar: ArtifactEntry,
+    bootFiles: List[SbtBootFile],
+    bootCoursierCache: List[ArtifactEntry],
+    scalaInstance: List[ArtifactEntry],
+    compilerBridge: List[ArtifactEntry]
+) derives Codec.AsObject
+
+/** Lockfile shape for the `lock-sbt` path, discriminated by `kind = "sbt"`.
+  *
+  * There is no `targets` map: an sbt build picks its own platform and Scala
+  * version from `build.sbt`, so there is nothing for us to cross-build over.
+  * `modules` takes its place, keyed by sbt project id.
+  *
+  * `sources` and `resourceDirs` are the *union* of every module's main scope,
+  * because sbt loads and may compile the whole build even when asked for one
+  * module. Test sources stay per-module under `modules.<id>.test`.
+  *
+  * `pluginDependencies` is the meta-build's plugin closure (empty when the
+  * project has no `project/plugins.sbt`). It is project-specific, so it sits
+  * here rather than in `sbt` where it would break toolchain sharing.
+  */
+case class SbtLockFile(
+    version: Int,
+    kind: String,
+    sources: List[String],
+    resourceDirs: List[String],
+    modules: Map[String, SbtModuleLock],
+    pluginDependencies: List[ArtifactEntry],
+    sbt: SbtToolchainLock
+) derives Codec.AsObject
 
 case class ExportArtifactId(fullName: String) derives Decoder
 
@@ -692,14 +804,85 @@ def collectImportedBoms(
   * tuples for each <dependency> in the POM's <dependencies> section. Excludes
   * deps inside <dependencyManagement>. May include unresolved property
   * placeholders like ${project.version} — caller filters those out.
+  *
+  * A `<dependency>` with no `<version>` inherits it from an ancestor POM's
+  * `<dependencyManagement>`, which this function cannot see. Those are
+  * returned with the empty string as version; the caller resolves them via
+  * `collectAccumulatedDependencyManagement`.
   */
 def parseDeclaredDeps(pomContent: String): List[(String, String, String)] = {
   val root = loadPom(pomContent)
-  (root \ "dependencies" \ "dependency").toList.flatMap(parseGAV(_))
+  (root \ "dependencies" \ "dependency").toList.flatMap { dep =>
+    for {
+      g <- childText(dep, "groupId")
+      a <- childText(dep, "artifactId")
+    } yield (g, a, childText(dep, "version").getOrElse(""))
+  }
 }
 
 def extractDeclaredDeps(pomPath: Path): IO[List[(String, String, String)]] =
   readFile(pomPath).map(parseDeclaredDeps)
+
+/** `(groupId, artifactId) -> version` entries from a POM's own
+  * `<dependencyManagement>`, excluding `<scope>import</scope>` BOMs (those are
+  * handled by `parseImportedBoms` / `collectImportedBoms`).
+  */
+def parseDependencyManagement(
+    pomContent: String,
+    properties: Map[String, String] = Map.empty
+): Map[(String, String), String] = {
+  val root = loadPom(pomContent)
+  val entries = root \ "dependencyManagement" \ "dependencies" \ "dependency"
+  entries.toList.flatMap { dep =>
+    val isImport = childText(dep, "scope").contains("import")
+    if (isImport) Nil
+    else
+      parseGAV(dep).toList.flatMap { (g, a, v) =>
+        val resolved = substituteProperties(v, properties)
+        Option.when(!resolved.contains("$"))(((g, a), resolved))
+      }
+  }.toMap
+}
+
+/** Walk a POM's `<parent>` chain and merge every `<dependencyManagement>`
+  * section into one `(groupId, artifactId) -> version` map, descendants
+  * overriding ancestors.
+  *
+  * This exists because many POMs declare `<dependency>` blocks with no
+  * `<version>` — the version is inherited from an ancestor's
+  * `<dependencyManagement>`. Without this walk those deps are silently dropped
+  * from the lockfile and offline resolution later fails on them (the concrete
+  * case that forced it: `jackson-annotations:2.12.1.pom`, needed by sbt's
+  * lm-coursier on Linux).
+  *
+  * Imported BOMs are deliberately *not* expanded here; `collectImportedBoms`
+  * already walks those.
+  */
+def collectAccumulatedDependencyManagement(
+    pomPath: Path,
+    repoBase: String
+): IO[Map[(String, String), String]] = {
+  def loop(
+      current: Path,
+      acc: Map[(String, String), String]
+  ): IO[Map[(String, String), String]] =
+    readFile(current).flatMap { content =>
+      val props = parseProperties(content)
+      val own = parseDependencyManagement(content, props)
+      extractParent(current).flatMap {
+        case Some((g, a, v)) if repoBase.nonEmpty =>
+          val groupPath = g.replace('.', '/')
+          val parentUrl = s"$repoBase$groupPath/$a/$v/$a-$v.pom"
+          val parentPath = cachePathForUrl(parentUrl)
+          Files[IO].exists(parentPath).flatMap {
+            case true  => loop(parentPath, acc).map(_ ++ own)
+            case false => IO.pure(acc ++ own)
+          }
+        case _ => IO.pure(acc ++ own)
+      }
+    }
+  loop(pomPath, Map.empty)
+}
 
 /** Top-level POM version. Falls back to the parent's <version> when missing
   * (POM inherits the version from its parent).
@@ -736,36 +919,53 @@ def parseImportedBoms(
 }
 
 /** Walk all resolved POMs to find declared deps and fetch their JAR + POM
-  * individually. This captures evicted versions that scala-cli may try to fetch
-  * during offline resolution.
+  * individually. This captures evicted versions that scala-cli (or sbt's
+  * lm-coursier) may try to fetch during offline resolution.
   *
   * Each declared dep is fetched as its own resolution. Unlike
   * `withTransitive(false)` which fails on some artifacts in the Coursier
   * interface, this works reliably. Failures are tolerated (e.g. for
   * placeholder/marker artifacts).
+  *
+  * Deps declared without a `<version>` get theirs from the accumulated
+  * `<dependencyManagement>` of the POM and its ancestors; see
+  * `collectAccumulatedDependencyManagement`.
   */
 def collectDeclaredPoms(
     resolvedPomPaths: List[Path],
     resolvedUrls: Set[String]
 )(using HashCache, Repos): IO[List[ArtifactEntry]] =
-  resolvedPomPaths.flatTraverse(extractDeclaredDeps).flatMap { allDeclared =>
-    val candidates = allDeclared.distinct
-      .filterNot { (_, _, v) => v.contains("$") }
-      // Skip resolved winners (their JAR URL would already appear in resolvedUrls)
-      .filterNot { (g, a, v) =>
-        resolvedUrls.exists { u =>
-          u.contains(s"${g.replace('.', '/')}/$a/$v/")
+  resolvedPomPaths
+    .flatTraverse { pomPath =>
+      for {
+        content <- readFile(pomPath)
+        repoBase <- repoBaseForPom(pomPath, urlForCachePath(pomPath))
+        depMgmt <- collectAccumulatedDependencyManagement(pomPath, repoBase)
+        declared = parseDeclaredDeps(content)
+        withVersion = declared.flatMap { (g, a, v) =>
+          val resolved = if (v.isEmpty) depMgmt.get((g, a)) else Some(v)
+          resolved.map(rv => (g, a, rv))
+        }
+      } yield withVersion
+    }
+    .flatMap { allDeclared =>
+      val candidates = allDeclared.distinct
+        .filterNot { (_, _, v) => v.contains("$") }
+        // Skip resolved winners (their JAR URL would already appear in resolvedUrls)
+        .filterNot { (g, a, v) =>
+          resolvedUrls.exists { u =>
+            u.contains(s"${g.replace('.', '/')}/$a/$v/")
+          }
+        }
+
+      candidates.flatTraverse { (g, a, v) =>
+        val dep = Dependency.of(g, a, v)
+        fetchArtifacts(dep).attempt.flatMap {
+          case Right(arts) => collectEntriesNoRecurse(arts)
+          case Left(_)     => IO.pure(List.empty[ArtifactEntry])
         }
       }
-
-    candidates.flatTraverse { (g, a, v) =>
-      val dep = Dependency.of(g, a, v)
-      fetchArtifacts(dep).attempt.flatMap {
-        case Right(arts) => collectEntriesNoRecurse(arts)
-        case Left(_)     => IO.pure(List.empty[ArtifactEntry])
-      }
     }
-  }
 
 /** Like collectEntries but does not recursively walk declared deps (avoids
   * infinite loop).
@@ -999,6 +1199,20 @@ case class LockCoordsOptions(
     output: Option[String] = None
 )
 
+
+case class LockSbtOptions(
+    @HelpMessage(
+      "Extra Maven repository URL to add to Coursier resolution (e.g. an Artifactory virtual repo). Repeatable. Credentials are loaded from ~/.config/coursier/credentials.properties (or COURSIER_CREDENTIALS / COURSIER_CONFIG_DIR)."
+    )
+    repository: List[String] = Nil,
+    @HelpMessage(
+      "Do not include Maven Central (or ivy2Local) in the Coursier resolution. All artifacts must be reachable from the --repository URLs."
+    )
+    noDefaultRepositories: Boolean = false,
+    @HelpMessage("Output lockfile path (default: scala.lock.json).")
+    @Name("o")
+    output: Option[String] = None
+)
 case class DedupCacheOptions(
     @HelpMessage("Apply changes without asking for confirmation.")
     @Name("y")
@@ -2693,6 +2907,602 @@ def dedupCache(opts: DedupCacheOptions): IO[ExitCode] = withHashCache {
   } yield result
 }
 
+// --- sbt lock command ---
+//
+// Locking an sbt project means asking sbt itself what the build looks like: we
+// inject one-off tasks that print JSON manifests (modules, Scala versions,
+// main classes, sources, declared dependencies, plugins), then feed the
+// coordinates through the same Coursier resolution + hashing pipeline the
+// scala-cli path uses. Unlike that path, the *build* also needs sbt itself
+// available offline, so we additionally lock the launcher, sbt's own boot
+// classpath, the scalaInstance and the compiler bridge.
+
+private val SbtManifestBegin = "##SCN_MANIFEST_BEGIN##"
+private val SbtManifestEnd = "##SCN_MANIFEST_END##"
+
+/** The sbt task we inject to read the build, written to `scn-manifest.sbt` in
+  * the project root and deleted afterwards.
+  *
+  * `ScopeFilter(inAnyProject)` plus `.all(...)` is what makes this
+  * multi-module: every setting is read once per project in the build, in a
+  * stable order, so one task invocation describes the whole build. Note that
+  * sbt synthesizes an aggregate root project for the build's base directory
+  * when `build.sbt` doesn't define one; it shows up here like any other
+  * module, with no sources and no main class.
+  *
+  * Plugins are read from the same task, out of the loaded build's plugin data,
+  * rather than by running a second task inside the meta-build. `reload
+  * plugins` / `reload return` would be the idiomatic way to reach `project/`,
+  * but sbt 2 removed those commands.
+  *
+  * `Compile / unmanagedSources` (not `sources`) is deliberate: `sources`
+  * includes generated files under `target/`, which don't exist in the sandbox
+  * and would be recorded as phantom paths. Generators that are self-contained
+  * re-run inside the sandbox anyway.
+  *
+  * `Compile / packageBin / artifactPath` is a *setting*, so reading it costs
+  * nothing. `Compile / mainClass` is a task that compiles the project — which
+  * is why locking an sbt project builds it once, at lock time, where there is
+  * still a network.
+  *
+  * The key must be a `val` (`val scnManifest = taskKey[...]`) rather than
+  * constructed inline as `TaskKey[Unit]("scnManifest") := ...`. sbt 1 accepts
+  * either, but sbt 2 builds its key index from the build definition's `val`
+  * declarations, so the inline form compiles fine and then isn't addressable
+  * from the command line: `Not a valid key: scnManifest`.
+  *
+  * Statements have to be declarations too — a bare `println(...)` at the top
+  * level of a `.sbt` file is a compile error in sbt 2.
+  *
+  * `@transient` on the key is load-bearing on sbt 2, which caches task results
+  * to disk. Without it this task doesn't even compile there — sbt 2 wants a
+  * `sjsonnew.HashWriter` for the whole input tuple and there is none for
+  * `ResolvedProject` / `ModuleID` / `VirtualFileRef` — and were a `HashWriter`
+  * somehow found, the second lock of an unchanged project would be a cache hit
+  * that prints nothing, failing on the missing sentinels. `@transient` is the
+  * opt-out sbt 2 itself suggests (alongside `Def.uncached`, which sbt 1
+  * doesn't have); being a plain Scala annotation, sbt 1 just ignores it.
+  *
+  * JSON is printed by hand rather than via a library: the meta-build has no
+  * JSON dependency and adding one would mean resolving it at an awkward
+  * moment. Output is sentinel-delimited so sbt's own logging can be discarded.
+  *
+  * We don't ask sbt for scalaInstance / compiler-bridge paths. The CLI
+  * re-resolves both from canonical coordinates instead, which routes them
+  * through `collectEntries` and so captures the parent POMs, imported BOMs and
+  * evicted-version POMs that offline resolution needs.
+  */
+private val SbtManifestSbt: String =
+  """@transient val scnManifest = taskKey[Unit]("scala-cli-nix build manifest")
+    |val scnAllProjects = ScopeFilter(inAnyProject)
+    |
+    |scnManifest := {
+    |  val projs = thisProject.all(scnAllProjects).value
+    |  val svs = scalaVersion.all(scnAllProjects).value
+    |  val sbvs = scalaBinaryVersion.all(scnAllProjects).value
+    |  val mcs = (Compile / mainClass).all(scnAllProjects).value
+    |  val libs = libraryDependencies.all(scnAllProjects).value
+    |  val mainSrcs = (Compile / unmanagedSources).all(scnAllProjects).value
+    |  val mainResDirs = (Compile / unmanagedResourceDirectories).all(scnAllProjects).value
+    |  val testSrcs = (Test / unmanagedSources).all(scnAllProjects).value
+    |  val testResDirs = (Test / unmanagedResourceDirectories).all(scnAllProjects).value
+    |  val pkgBins = (Compile / packageBin / artifactPath).all(scnAllProjects).value
+    |  val buildBase = (ThisBuild / baseDirectory).value.toPath
+    |  val sbtVer = sbtVersion.value
+    |  val scalaBootVersion = scala.util.Properties.versionNumberString
+    |  val scnConverter = fileConverter.value
+    |  // The launcher's own view of its boot layout: `scalaProvider.jars` is
+    |  // what lives in `<boot>/scala-<v>/lib/` and `mainClasspath` is what
+    |  // lives in `<boot>/scala-<v>/org.scala-sbt/sbt/<sbtVersion>/`. Reporting
+    |  // the real file list beats reconstructing it from Maven coordinates:
+    |  // the two sbt generations lay `lib/` out differently (sbt 1 unversions
+    |  // scala-compiler/library/reflect; sbt 2 keeps versioned Scala 3 names
+    |  // plus an unversioned scala-library.jar), and that is sbt's business to
+    |  // know, not ours to guess.
+    |  val scnProvider = appConfiguration.value.provider
+    |  val scnBootDir = scnProvider.scalaProvider.launcher.bootDirectory.toPath
+    |  val scnBootFiles =
+    |    (scnProvider.scalaProvider.jars.toSeq ++ scnProvider.mainClasspath.toSeq).distinct
+    |
+    |  def q(s: String): String =
+    |    "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+    |  def arr(items: Seq[String]): String = items.mkString("[", ",", "]")
+    |  // sbt 1 hands back a java.io.File here; sbt 2 runs on virtual paths and
+    |  // hands back an xsbti.VirtualFileRef whose toString is placeholder-based
+    |  // ("${OUT}/jvm/scala-3.9.0/..."). `fileConverter` exists in both and maps
+    |  // either back to a real path, so this stays version-agnostic rather than
+    |  // hardcoding what ${OUT} expands to.
+    |  def realPath(a: Any): java.nio.file.Path = a match {
+    |    case f: java.io.File => f.toPath
+    |    case other => scnConverter.toPath(other.asInstanceOf[xsbti.VirtualFileRef])
+    |  }
+    |  // Paths are recorded relative to the build root, which is what the
+    |  // sandbox sees as its source tree. Anything outside it (a symlinked
+    |  // source dir, say) has no in-sandbox equivalent and is dropped.
+    |  def rel(a: Any): Option[String] = {
+    |    val r = buildBase.relativize(realPath(a)).toString
+    |    if (r.startsWith("..") || r.isEmpty) None else Some(r)
+    |  }
+    |  def relAll(fs: Seq[File]): Seq[String] = fs.flatMap(rel).distinct.sorted
+    |
+    |  def isScalaStd(m: ModuleID): Boolean =
+    |    m.organization == "org.scala-lang" &&
+    |      (m.name == "scala-library" || m.name == "scala3-library" ||
+    |       m.name == "scala-compiler" || m.name == "scala3-compiler" ||
+    |       m.name == "scala-reflect")
+    |  // A dependency declared `% Test` carries configurations = Some("test")
+    |  // (or "test->..."). Everything else — None, compile, runtime, default,
+    |  // provided, optional — is treated as main scope: it must be in the
+    |  // cache for compilation either way, and for a standalone app there is
+    |  // no container to supply a `provided` jar at runtime.
+    |  def isTestScope(m: ModuleID): Boolean =
+    |    m.configurations.exists(_.toLowerCase.startsWith("test"))
+    |  def depJson(m: ModuleID, sv: String, sbv: String): String = {
+    |    val name = m.crossVersion match {
+    |      case _: CrossVersion.Binary => m.name + "_" + sbv
+    |      case _: CrossVersion.Full   => m.name + "_" + sv
+    |      case _                      => m.name
+    |    }
+    |    "{\"groupId\":" + q(m.organization) + ",\"artifactId\":" + q(name) +
+    |      ",\"version\":" + q(m.revision) + "}"
+    |  }
+    |
+    |  val moduleJson = projs.zipWithIndex.map { case (p, i) =>
+    |    val sv = svs(i)
+    |    val sbv = sbvs(i)
+    |    val declared = libs(i).filterNot(isScalaStd).distinct
+    |    val mainDeps = declared.filterNot(isTestScope).map(m => depJson(m, sv, sbv))
+    |    val testDeps = declared.filter(isTestScope).map(m => depJson(m, sv, sbv))
+    |    val mainJson = mcs(i) match { case Some(m) => q(m); case None => "null" }
+    |    val pkgBin = rel(pkgBins(i)).getOrElse("")
+    |    "{\"id\":" + q(p.id) +
+    |      ",\"scalaVersion\":" + q(sv) +
+    |      ",\"mainClass\":" + mainJson +
+    |      ",\"packageBin\":" + q(pkgBin) +
+    |      ",\"dependsOn\":" + arr(p.dependencies.map(d => q(d.project.project))) +
+    |      ",\"sources\":" + arr(relAll(mainSrcs(i)).map(q)) +
+    |      ",\"resourceDirs\":" + arr(relAll(mainResDirs(i).filter(_.exists)).map(q)) +
+    |      ",\"dependencies\":" + arr(mainDeps) +
+    |      ",\"testSources\":" + arr(relAll(testSrcs(i)).map(q)) +
+    |      ",\"testResourceDirs\":" + arr(relAll(testResDirs(i).filter(_.exists)).map(q)) +
+    |      ",\"testDependencies\":" + arr(testDeps) + "}"
+    |  }
+    |
+    |  // Plugins come from the meta-build's own resolution, reachable from
+    |  // here via the loaded build's plugin data. `reload plugins` would be
+    |  // the obvious route but sbt 2 removed that command, and this works on
+    |  // both. `allModules` is already the resolved closure, so the CLI pins
+    |  // each coordinate rather than re-resolving it.
+    |  val pluginModules = sbt.Project
+    |    .extract(state.value)
+    |    .currentUnit
+    |    .unit
+    |    .plugins
+    |    .pluginData
+    |    .report
+    |    .toSeq
+    |    .flatMap(_.allModules)
+    |  def attr(m: ModuleID, k: String): Option[String] =
+    |    m.extraAttributes.get("e:" + k).orElse(m.extraAttributes.get(k))
+    |  // sbt 1 reports a plugin under its *unsuffixed* name plus sbtVersion /
+    |  // scalaVersion marker attributes; the published Maven artifact is
+    |  // `<name>_<scalaVersion>_<sbtVersion>` (sbt-buildinfo_2.12_1.0). sbt 2
+    |  // reports the suffixed name directly (sbt-assembly_sbt2_3) and carries
+    |  // no markers. Requiring *both* markers is what distinguishes the two,
+    |  // and it also excludes unrelated artifacts that happen to carry other
+    |  // extra attributes (scala3-sbt-bridge has info.* ones).
+    |  val pluginJson = pluginModules.map { m =>
+    |    val name = (attr(m, "scalaVersion"), attr(m, "sbtVersion")) match {
+    |      case (Some(scalaBin), Some(sbtBin)) =>
+    |        m.name + "_" + scalaBin + "_" + sbtBin
+    |      case _ => m.name
+    |    }
+    |    "{\"groupId\":" + q(m.organization) + ",\"artifactId\":" + q(name) +
+    |      ",\"version\":" + q(m.revision) + "}"
+    |  }.distinct
+    |  val bootFileJson = scnBootFiles.map { f =>
+    |    q(scnBootDir.relativize(f.toPath).toString)
+    |  }
+    |  val payload =
+    |    "{\"bootFiles\":" + arr(bootFileJson) +
+    |      ",\"bootDirectory\":" + q(scnBootDir.toString) +
+    |      ",\"sbtVersion\":" + q(sbtVer) +
+    |      ",\"scalaBootVersion\":" + q(scalaBootVersion) +
+    |      ",\"plugins\":" + arr(pluginJson) +
+    |      ",\"modules\":" + arr(moduleJson) + "}"
+    |  println("##SCN_MANIFEST_BEGIN##")
+    |  println(payload)
+    |  println("##SCN_MANIFEST_END##")
+    |}
+    |""".stripMargin
+
+case class SbtManifestDep(groupId: String, artifactId: String, version: String)
+    derives Decoder {
+  def toDependency: Dependency = Dependency.of(groupId, artifactId, version)
+}
+
+case class SbtManifestModule(
+    id: String,
+    scalaVersion: String,
+    mainClass: Option[String],
+    packageBin: String,
+    dependsOn: List[String],
+    sources: List[String],
+    resourceDirs: List[String],
+    dependencies: List[SbtManifestDep],
+    testSources: List[String],
+    testResourceDirs: List[String],
+    testDependencies: List[SbtManifestDep]
+) derives Decoder
+
+case class SbtManifest(
+    sbtVersion: String,
+    scalaBootVersion: String,
+    bootDirectory: String,
+    bootFiles: List[String],
+    plugins: List[SbtManifestDep],
+    modules: List[SbtManifestModule]
+) derives Decoder
+
+/** Transitive closure of the sbt projects `id` depends on, excluding `id`
+  * itself. `direct` maps each project id to its immediate `dependsOn` ids.
+  *
+  * Cycles can't occur in a well-formed sbt build, but a malformed one
+  * shouldn't hang the locker, so visited ids are tracked. The result is sorted
+  * for lockfile determinism; sbt works out the actual build order itself.
+  */
+def transitiveInternalDeps(
+    direct: Map[String, List[String]],
+    id: String
+): List[String] = {
+  @scala.annotation.tailrec
+  def loop(frontier: List[String], seen: Set[String]): Set[String] =
+    frontier match {
+      case Nil => seen
+      case next :: rest if seen.contains(next) => loop(rest, seen)
+      case next :: rest =>
+        loop(direct.getOrElse(next, Nil) ++ rest, seen + next)
+    }
+  (loop(direct.getOrElse(id, Nil), Set.empty) - id).toList.sorted
+}
+
+/** The `sbt` launcher to shell out to at lock time. `SCALA_CLI_NIX_SBT` is set
+  * by the Nix wrapper; the PATH fallback keeps the CLI usable outside Nix.
+  *
+  * This is only ever the *lock-time* sbt, which has network access and simply
+  * bootstraps whatever `project/build.properties` asks for. The sbt that runs
+  * inside the sandbox is the locked `sbt-launch.jar` instead — see
+  * `SbtToolchainLock`.
+  */
+private def sbtCommand: String =
+  sys.env.getOrElse("SCALA_CLI_NIX_SBT", "sbt")
+
+private def extractSentinel(
+    out: String,
+    begin: String,
+    end: String,
+    what: String
+): IO[String] = {
+  val beginIdx = out.indexOf(begin)
+  val endIdx = out.indexOf(end)
+  if (beginIdx < 0 || endIdx < 0)
+    IO.raiseError(
+      new RuntimeException(
+        s"sbt output did not contain the $what sentinels. Output:\n$out"
+      )
+    )
+  else IO.pure(out.substring(beginIdx + begin.length, endIdx).trim)
+}
+
+/** Run the manifest task, returning the parsed build description.
+  *
+  * One sbt startup and one injected file. Reading the plugins from the main
+  * build (see `SbtManifestSbt`) is what keeps it to one: the obvious route,
+  * `reload plugins` / `reload return` around a task defined in `project/`,
+  * only works on sbt 1 — sbt 2 removed those commands and rejects the command
+  * line with "Expected end of input".
+  */
+private def runSbtManifest(projectDir: Path): IO[SbtManifest] = {
+  val manifestSbt = projectDir / "scn-manifest.sbt"
+  val runSbt =
+    ProcessBuilder(
+      sbtCommand,
+      // `--server` forces the in-process JVM sbt instead of the native thin
+      // client. For sbt 2 the launcher defaults to the client, which talks to
+      // a persistent background server — and a server started before we wrote
+      // `scn-manifest.sbt` serves its already-loaded build definition, so the
+      // task simply isn't there: `Not a valid key: scnManifest`. It also means
+      // we never attach to (or disturb) a developer's running sbt session.
+      List("--server", "-no-colors", "-batch", "scnManifest")
+    )
+      .withWorkingDirectory(projectDir)
+      .spawn[IO]
+      .use { proc =>
+        val stdout = proc.stdout.through(fs2.text.utf8.decode).compile.string
+        val stderr = proc.stderr.through(fs2.io.stderr[IO]).compile.drain
+        (stdout, stderr).parTupled.flatMap { (out, _) =>
+          proc.exitValue.flatMap { code =>
+            // sbt reports task and build-definition errors on *stdout*, which
+            // we capture rather than forward. Replaying it into the failure
+            // means a broken build definition says so instead of just
+            // surfacing an exit code.
+            IO.raiseError(
+              new RuntimeException(s"sbt exited with code $code. Output:\n$out")
+            ).whenA(code != 0)
+              .as(out)
+          }
+        }
+      }
+  (writeFile(manifestSbt, SbtManifestSbt) *> runSbt)
+    .guarantee(Files[IO].deleteIfExists(manifestSbt).void)
+    .flatMap { out =>
+      extractSentinel(out, SbtManifestBegin, SbtManifestEnd, "manifest")
+        .flatMap { payload =>
+          IO.fromEither(
+            parseJson(payload)
+              .flatMap(_.as[SbtManifest])
+              .leftMap(e =>
+                new RuntimeException(
+                  s"Failed to parse the sbt manifest: $e\n$payload"
+                )
+              )
+          )
+        }
+    }
+}
+
+
+/** Coordinates whose resolution yields the Zinc `scalaInstance` for a given
+  * Scala version — the compiler sbt will invoke. For Scala 3 that is
+  * `scala3-compiler` plus `scaladoc` (sbt puts both on the instance's
+  * classpath); for Scala 2 the single `scala-compiler` artifact pulls in what
+  * it needs transitively.
+  */
+private def scalaInstanceDeps(scalaVersion: String): List[Dependency] =
+  scalaVersion.takeWhile(_ != '.') match {
+    case "3" =>
+      List(
+        Dependency.of("org.scala-lang", "scala3-compiler_3", scalaVersion),
+        Dependency.of("org.scala-lang", "scaladoc_3", scalaVersion)
+      )
+    case "2" =>
+      List(Dependency.of("org.scala-lang", "scala-compiler", scalaVersion))
+    case other =>
+      sys.error(s"scala-cli-nix: unsupported Scala major version '$other'")
+  }
+
+/** Compiler bridge coordinates. Scala 3 publishes a prebuilt bridge per
+  * compiler version; Scala 2's bridge is published per *sbt* version and is
+  * compiled by sbt on first use, which is why its sources have to be in the
+  * offline cache too.
+  */
+private def compilerBridgeDep(
+    scalaVersion: String,
+    sbtVersion: String
+): Dependency =
+  scalaVersion.takeWhile(_ != '.') match {
+    case "3" =>
+      Dependency.of("org.scala-lang", "scala3-sbt-bridge", scalaVersion)
+    case "2" =>
+      val binaryVersion = scalaVersion.split('.').take(2).mkString(".")
+      Dependency.of(
+        "org.scala-sbt",
+        s"compiler-bridge_$binaryVersion",
+        sbtVersion
+      )
+    case other =>
+      sys.error(s"scala-cli-nix: unsupported Scala major version '$other'")
+  }
+
+private def sortedEntries(entries: List[ArtifactEntry]): List[ArtifactEntry] =
+  entries.distinctBy(_.url).sortBy(_.url)
+
+/** Resolve a dependency set and hash it along with every POM the offline
+  * resolver will want. Empty in, empty out — no pointless Coursier call.
+  */
+private def resolveAndHash(
+    deps: List[Dependency]
+)(using HashCache, Repos): IO[List[ArtifactEntry]] =
+  if (deps.isEmpty) IO.pure(Nil)
+  else fetchArtifacts(deps*).flatMap(collectEntries).map(sortedEntries)
+
+def computeSbtLock(
+    manifest: SbtManifest
+)(using HashCache, Repos): IO[String] = {
+  val directDeps =
+    manifest.modules.map(m => m.id -> m.dependsOn).toMap
+  // sbt's own Scala is in here alongside the modules': the launcher's `lib/`
+  // holds sbt's Scala stack, and for sbt 2 that is a Scala *3* compiler whose
+  // version need not match anything the project compiles with.
+  val scalaVersions =
+    (manifest.scalaBootVersion :: manifest.modules.map(_.scalaVersion)).distinct.sorted
+
+  for {
+    _ <- info(s"sbt version: ${C.bold}${manifest.sbtVersion}${C.reset}")
+    _ <- info(
+      s"sbt's own Scala (boot): ${C.bold}${manifest.scalaBootVersion}${C.reset}"
+    )
+    _ <- info(
+      s"Scala version(s): ${C.bold}${scalaVersions.mkString(", ")}${C.reset}"
+    )
+    _ <- info(
+      s"Modules: ${C.bold}${manifest.modules.map(_.id).mkString(", ")}${C.reset}"
+    )
+    _ <- manifest.modules.traverse_ { m =>
+      val mc = m.mainClass.getOrElse("<none>")
+      val deps =
+        if (m.dependsOn.isEmpty) "" else s", dependsOn ${m.dependsOn.mkString("+")}"
+      info(
+        s"  ${C.bold}${m.id}${C.reset}: ${m.sources.size} sources, " +
+          s"${m.dependencies.size} deps, main class $mc$deps"
+      )
+    }
+
+    // --- Per-module dependency resolution ---
+    // Each module resolves on its own: two modules can legitimately land on
+    // different winners for the same library, and each needs its own winner in
+    // the cache for sbt's offline update to succeed.
+    moduleLocks <- manifest.modules.traverse { m =>
+      for {
+        _ <- step(s"Resolving dependencies for ${m.id}...")
+        mainEntries <- resolveAndHash(m.dependencies.map(_.toDependency))
+        // The test scope compiles against the main scope too, so its cache
+        // needs both resolutions.
+        testEntries <- resolveAndHash(
+          (m.dependencies ++ m.testDependencies).map(_.toDependency)
+        )
+        testLock = Option.when(m.testSources.nonEmpty)(
+          SbtTestLock(
+            sources = m.testSources,
+            resourceDirs = m.testResourceDirs,
+            libraryDependencies = testEntries
+          )
+        )
+      } yield m.id -> SbtModuleLock(
+        scalaVersion = m.scalaVersion,
+        mainClass = m.mainClass,
+        packageBin = m.packageBin,
+        internalDependencies = transitiveInternalDeps(directDeps, m.id),
+        libraryDependencies = mainEntries,
+        test = testLock
+      )
+    }
+
+    // --- sbt plugins (meta-build) ---
+    _ <- info(
+      s"Meta-build (plugin) modules: ${C.bold}${manifest.plugins.size}${C.reset}"
+    )
+    pluginEntries <- {
+      if (manifest.plugins.isEmpty) IO.pure(List.empty[ArtifactEntry])
+      else
+        step("Resolving sbt plugins...") *> {
+          // `manifest.plugins` is sbt's *already resolved* meta-build closure,
+          // so every version in it is one sbt will ask for offline. Forcing
+          // each (group, artifact) to that exact version reproduces sbt's
+          // resolution in a single Coursier pass; letting Coursier reconcile
+          // freely could evict a version sbt still wants and leave its JAR out
+          // of the cache.
+          val forced = manifest.plugins.map(d =>
+            (d.groupId, d.artifactId, d.version)
+          )
+          fetchArtifactsForced(forced, manifest.plugins.map(_.toDependency)*)
+            .flatMap(collectEntries)
+            .map(sortedEntries)
+        }
+    }
+
+    // --- sbt launcher JAR, exec'd directly inside the sandbox ---
+    _ <- step(s"Resolving sbt launcher (sbt ${manifest.sbtVersion})...")
+    launcherArtifacts <- fetchArtifacts(
+      Dependency.of("org.scala-sbt", "sbt-launch", manifest.sbtVersion)
+    )
+    launcherJarArtifact = launcherArtifacts
+      .find(_._1.getUrl.endsWith(s"sbt-launch-${manifest.sbtVersion}.jar"))
+      .getOrElse(
+        sys.error(
+          s"scala-cli-nix: org.scala-sbt:sbt-launch:${manifest.sbtVersion} did not resolve a jar"
+        )
+      )
+
+    // --- sbt's own boot classpath ---
+    _ <- step(s"Resolving sbt boot artifacts (sbt ${manifest.sbtVersion})...")
+    bootArtifacts <- fetchArtifacts(
+      Dependency.of("org.scala-sbt", "sbt", manifest.sbtVersion)
+    )
+    _ <- info(
+      s"sbt boot: ${C.bold}${bootArtifacts.size}${C.reset} artifacts (resolved)"
+    )
+
+    _ <- step("Resolving scalaInstance(s)...")
+    scalaInstanceEntries <- resolveAndHash(
+      scalaVersions.flatMap(scalaInstanceDeps)
+    )
+
+    _ <- step("Resolving compiler bridge(s)...")
+    bridgeEntries <- resolveAndHash(
+      scalaVersions.map(compilerBridgeDep(_, manifest.sbtVersion))
+    )
+
+    _ <- step("Hashing sbt launcher...")
+    launcherEntry <- {
+      val (artifact, file) = launcherJarArtifact
+      sha256Base64(Path.fromNioPath(file.toPath))
+        .map(h => ArtifactEntry(artifact.getUrl, h))
+    }
+
+    _ <- step("Hashing sbt boot Coursier cache (full transitive)...")
+    bootCacheEntries <- collectEntries(bootArtifacts)
+
+    // Recover each boot file's origin by content hash. The launcher renames
+    // files on its way into the boot directory (sbt 1's `scala-library.jar` is
+    // `scala-library-<v>.jar` from Maven), so the name tells us nothing, but
+    // the bytes are untouched.
+    _ <- step("Matching sbt boot files to resolved artifacts...")
+    bootFileEntries <- {
+      val hashToUrl =
+        (bootCacheEntries ++ scalaInstanceEntries ++ bridgeEntries)
+          .map(e => e.sha256 -> e.url)
+          .toMap
+      val bootRoot = Path(manifest.bootDirectory)
+      manifest.bootFiles.sorted.traverse { rel =>
+        sha256Base64(bootRoot / rel).map { hash =>
+          hashToUrl.get(hash) match {
+            case Some(url) => SbtBootFile(rel, url, hash)
+            case None      =>
+              // Leaving a boot file out would surface in the sandbox as
+              // sbt#4955 or a NoClassDefFoundError, a long way from the cause.
+              sys.error(
+                s"scala-cli-nix: boot file '$rel' under ${manifest.bootDirectory} " +
+                  "does not match any resolved artifact, so there is no URL to " +
+                  "fetch it from in the sandbox. This usually means sbt's boot " +
+                  "directory holds something the `org.scala-sbt:sbt` / " +
+                  "scalaInstance resolutions don't cover; please report it."
+              )
+          }
+        }
+      }
+    }
+
+    lockFile = SbtLockFile(
+      version = 9,
+      kind = "sbt",
+      sources = manifest.modules.flatMap(_.sources).distinct.sorted,
+      resourceDirs = manifest.modules.flatMap(_.resourceDirs).distinct.sorted,
+      modules = moduleLocks.toMap,
+      pluginDependencies = pluginEntries,
+      sbt = SbtToolchainLock(
+        sbtVersion = manifest.sbtVersion,
+        scalaBootVersion = manifest.scalaBootVersion,
+        launcherJar = launcherEntry,
+        bootFiles = bootFileEntries,
+        bootCoursierCache = sortedEntries(bootCacheEntries),
+        scalaInstance = scalaInstanceEntries,
+        compilerBridge = bridgeEntries
+      )
+    )
+  } yield lockfilePrinter.print(lockFile.asJson) + "\n"
+}
+
+def lockSbt(opts: LockSbtOptions): IO[ExitCode] = withHashCache {
+  given Repos = Repos(opts.repository.distinct, opts.noDefaultRepositories)
+  for {
+    cwd <- Files[IO].currentWorkingDirectory
+    _ <- step("Reading the sbt build...")
+    manifest <- runSbtManifest(cwd)
+    content <- computeSbtLock(manifest)
+    lockfilePath = cwd / opts.output.getOrElse("scala.lock.json")
+    existing <- Files[IO]
+      .exists(lockfilePath)
+      .ifM(readFile(lockfilePath), IO.pure(""))
+    _ <-
+      if (existing == content) info("Lock is up to date.")
+      else
+        step("Writing lockfile...") *>
+          writeFile(lockfilePath, content) *>
+          success(s"Wrote ${C.bold}${lockfilePath.fileName}${C.reset}")
+  } yield ExitCode.Success
+}
+
 // --- Main ---
 
 /** Run an `IO[ExitCode]` and exit the JVM with the resulting code. We bridge
@@ -2714,7 +3524,13 @@ object ScalaCliNix extends CommandsEntryPoint {
   override def progName: String = "scala-cli-nix"
   override def description: String = "Nix packaging for scala-cli apps"
   override def commands: Seq[Command[?]] =
-    Seq(InitCommand, LockCommand, LockCoordsCommand, DedupCacheCommand)
+    Seq(
+      InitCommand,
+      LockCommand,
+      LockSbtCommand,
+      LockCoordsCommand,
+      DedupCacheCommand
+    )
   override def enableCompleteCommand: Boolean = true
   override def enableCompletionsCommand: Boolean = true
 
@@ -2728,6 +3544,12 @@ object ScalaCliNix extends CommandsEntryPoint {
     override def name: String = "lock"
     override def run(options: LockOptions, args: RemainingArgs): Unit =
       runIO(lock(args.remaining.toList, options.src))
+  }
+
+  private object LockSbtCommand extends Command[LockSbtOptions] {
+    override def name: String = "lock-sbt"
+    override def run(options: LockSbtOptions, args: RemainingArgs): Unit =
+      runIO(lockSbt(options))
   }
 
   private object LockCoordsCommand extends Command[LockCoordsOptions] {
