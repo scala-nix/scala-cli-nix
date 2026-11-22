@@ -119,6 +119,8 @@ scn lock-sbt
 
 This asks sbt what the build looks like — modules, Scala versions, main classes, sources, dependencies, plugins — and writes a `scala.lock.json` with `kind = "sbt"`. Note that it compiles the project once, since sbt's `Compile / mainClass` is a task rather than a setting.
 
+Both sbt 1 and sbt 2 are supported (verified against 1.10.7 and 2.1.0).
+
 On the Nix side:
 
 ```nix

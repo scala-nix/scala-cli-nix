@@ -524,50 +524,32 @@ let
             || insideResourceDir rel;
     };
 
-  # Build sbt's boot dir layout. Two sublayouts:
-  #   - `<bootDir>/scala-<ver>/lib/{scala-library,scala-compiler,scala-reflect,scala-xml_<bin>-<v>}.jar`
-  #     The launcher expects the Scala stdlib jars here with their
-  #     *unversioned* sbt-flavored filenames (`scala-library.jar` etc.) because
-  #     that is how it names them when self-extracting from its own jar.
-  #   - `<bootDir>/scala-<ver>/org.scala-sbt/sbt/<sbtVersion>/<filename>.jar`
-  #     All other sbt-application jars, flat, named as published on Maven.
-  # `bootJars` must be ONLY the resolved-winner jars (no evicted versions, no
-  # POMs); otherwise sbt-launch refuses to start with sbt#4955 ("unable to
-  # detect the Scala version for org.scala-sbt:sbt").
-  mkSbtBootDir = name: sbtVersion: scalaBootVersion: bootJars:
+  # Reproduce sbt's boot directory exactly as the launcher laid it out. Each
+  # entry carries the path the launcher wants (`scala-<v>/lib/scala-library.jar`,
+  # `scala-<v>/org.scala-sbt/sbt/<ver>/main_3-<ver>.jar`, ...) and the artifact
+  # supplying those bytes; `scn lock-sbt` recorded the pairing by content hash.
+  #
+  # Nothing here derives a filename from a coordinate, and deliberately so. The
+  # launcher renames files on the way in, and the two sbt generations disagree
+  # about how — sbt 1's `lib/` has unversioned scala-compiler/library/reflect,
+  # sbt 2's has versioned Scala 3 names plus an unversioned scala-library.jar.
+  # Guessing it wrong is not a clean failure either: the launcher reports
+  # sbt#4955 ("unable to detect the Scala version for org.scala-sbt:sbt"),
+  # which reads as a resolution problem and isn't one.
+  #
+  # Only resolved winners are in `bootFiles`, because that is all the launcher
+  # itself keeps — an evicted or duplicate-artifactId jar in the boot directory
+  # is what genuinely does provoke sbt#4955.
+  mkSbtBootDir = name: bootFiles:
     let
-      # The `scala-` prefix is load-bearing, not cosmetic. The launcher accepts
-      # any directory under the boot dir, then recovers the Scala version by
-      # taking the substring after the last "scala-" in that directory's name
-      # (`BootConfiguration.extractScalaVersion`). A bare "2.12.20" is accepted
-      # as a boot dir and then yields no version, which the launcher reports as
-      # sbt#4955 — nominally "incomplete artifact resolution", in fact just a
-      # misnamed directory.
-      bootScalaDir = "scala-${scalaBootVersion}";
-      # Map a versioned Scala stdlib URL to the unversioned filename sbt wants.
-      libRename = url:
-        let
-          isLib = grp: nm:
-            lib.hasInfix "/${grp}/${nm}/${scalaBootVersion}/${nm}-${scalaBootVersion}.jar" url;
-        in
-          if isLib "org/scala-lang" "scala-library" then "scala-library.jar"
-          else if isLib "org/scala-lang" "scala-compiler" then "scala-compiler.jar"
-          else if isLib "org/scala-lang" "scala-reflect" then "scala-reflect.jar"
-          else if lib.hasInfix "/org/scala-lang/modules/scala-xml_" url
-            then baseNameOf url
-          else null;
-      libLinkCommands = builtins.concatLists (builtins.map (entry:
-        let mapped = libRename entry.dep.url;
-        in lib.optional (mapped != null)
-          "ln -sf ${entry.path} $out/${bootScalaDir}/lib/${mapped}"
-      ) bootJars);
-      appLinkCommands = builtins.map (entry:
-        "ln -sf ${entry.path} $out/${bootScalaDir}/org.scala-sbt/sbt/${sbtVersion}/${baseNameOf entry.dep.url}"
-      ) bootJars;
-    in runCommand name {} (builtins.concatStringsSep "\n" ([
-      "mkdir -p $out/${bootScalaDir}/lib $out/${bootScalaDir}/org.scala-sbt/sbt/${sbtVersion}"
-    ] ++ libLinkCommands ++ appLinkCommands));
-
+      # `entry.dep.path` is the boot-relative path from the lockfile;
+      # `entry.path` is the fetched store path. (`fetchAll` keeps the lockfile
+      # object under `dep`, which is why both are called "path".)
+      linkCommands = builtins.map (entry: ''
+        mkdir -p $out/$(dirname "${entry.dep.path}")
+        ln -sf ${entry.path} $out/${entry.dep.path}
+      '') bootFiles;
+    in runCommand name {} (builtins.concatStringsSep "\n" linkCommands);
   # Project-independent sbt environment: launcher jar + boot dir + a Coursier
   # cache prepopulated with everything sbt needs to bootstrap itself (the boot
   # transitive set including evicted POMs, the scalaInstance, and the compiler
@@ -581,8 +563,7 @@ let
     in {
       launcherJar = sbtBlock.launcherJar.path;
       inherit (sbtBlock) sbtVersion scalaBootVersion;
-      bootDir = mkSbtBootDir "sbt-boot-${key}"
-        sbtBlock.sbtVersion sbtBlock.scalaBootVersion sbtBlock.bootJars;
+      bootDir = mkSbtBootDir "sbt-boot-${key}" sbtBlock.bootFiles;
       coursierCache = mkCacheDir "sbt-coursier-${key}"
         (sbtBlock.bootCoursierCache ++ sbtBlock.scalaInstance ++ sbtBlock.compilerBridge);
     };
@@ -842,7 +823,7 @@ let
       sbt = {
         inherit (sbtJson) sbtVersion scalaBootVersion;
         launcherJar = builtins.head (fetchAll [ sbtJson.launcherJar ]);
-        bootJars = fetchAll sbtJson.bootJars;
+        bootFiles = fetchAll sbtJson.bootFiles;
         bootCoursierCache = fetchAll sbtJson.bootCoursierCache;
         scalaInstance = fetchAll sbtJson.scalaInstance;
         compilerBridge = fetchAll sbtJson.compilerBridge;

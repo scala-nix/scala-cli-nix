@@ -344,12 +344,11 @@ A third lockfile shape, `kind = "sbt"`, for projects built by sbt rather than sc
 
 #### Lock phase
 
-`scn lock-sbt` shells out to sbt (from `SCALA_CLI_NIX_SBT`, set by the Nix wrapper to `pkgs.sbt`; falls back to `sbt` on PATH). It writes two throwaway task files, runs them in one sbt invocation, and deletes them again:
+`scn lock-sbt` shells out to sbt (from `SCALA_CLI_NIX_SBT`, set by the Nix wrapper to `pkgs.sbt`; falls back to `sbt` on PATH). It writes one throwaway task file, runs it, and deletes it again:
 
-- `scn-manifest.sbt` in the project root — the `scnManifest` task. `ScopeFilter(inAnyProject)` plus `.all(...)` reads every setting once per project in the build, so a single invocation describes all modules.
-- `project/scn-manifest.sbt` — the `scnMetaManifest` task. Files under `project/` *are* the meta-build's build definition, which is where plugins live, so reaching it takes a `reload plugins` / `reload return` round trip. Both run in one command sequence: `sbt "reload plugins" scnMetaManifest "reload return" scnManifest`.
+- `scn-manifest.sbt` in the project root — the `scnManifest` task, invoked as `sbt --server -no-colors -batch scnManifest`. `ScopeFilter(inAnyProject)` plus `.all(...)` reads every setting once per project in the build, so a single invocation describes all modules. The key is a `@transient val` and the invocation forces `--server`; both are load-bearing on sbt 2 and explained under "sbt 1 vs sbt 2" below.
 
-Both tasks print hand-rolled JSON between sentinel lines (`##SCN_MANIFEST_BEGIN##` etc.) so sbt's own logging can be discarded. Hand-rolled because the meta-build has no JSON dependency and adding one would mean resolving it at an awkward moment.
+The task prints hand-rolled JSON between sentinel lines (`##SCN_MANIFEST_BEGIN##` / `##SCN_MANIFEST_END##`) so sbt's own logging can be discarded. Hand-rolled because pulling in a JSON library would mean resolving it at an awkward moment.
 
 Notable details of what the manifest reports:
 
@@ -364,7 +363,7 @@ sbt synthesizes an aggregate root project for builds whose `build.sbt` doesn't d
 
 The CLI then resolves, per module, the main scope and (main ∪ test) scope separately — two modules can legitimately land on different winners for the same library, and each needs its own winner in cache. On top of that it resolves the sbt-side artifacts described under "Toolchain" below.
 
-**Plugins.** An `addSbtPlugin(...)` entry lands in the meta-build's `libraryDependencies` with `crossVersion = Disabled` and the marker attributes `e:sbtVersion` / `e:scalaVersion` (e.g. `1.0` and `2.12`). Those two values *are* the suffix of the published Maven artifact name — `sbt-buildinfo` is published as `sbt-buildinfo_2.12_1.0` — so the coordinate is built from the very attributes that define it rather than from separately-read settings. The closure then resolves through Coursier like any other dependency. The meta-build's *non*-plugin dependencies (its Scala 2.12 compiler, `compiler-bridge_2.12`, `scala-xml_2.12`, jline) need no separate locking: they all fall out of the `org.scala-sbt:sbt:<version>` resolution already captured in `bootCoursierCache`.
+**Plugins.** Read from the same task, out of the loaded build's plugin data (`Project.extract(state).currentUnit.unit.plugins.pluginData.report`), rather than by running a task inside the meta-build — `reload plugins` would be the idiomatic route but sbt 2 removed it. `allModules` is already sbt's resolved meta-build closure, so the CLI pins every (group, artifact) to the version reported there and reproduces that resolution in one Coursier pass; letting Coursier reconcile freely could evict a version sbt still wants. Artifact naming differs between sbt generations — see "sbt 1 vs sbt 2". The meta-build's *non*-plugin dependencies (its own Scala compiler, compiler bridge, scala-xml, jline) need no separate locking: they all fall out of the `org.scala-sbt:sbt:<version>` resolution already captured in `bootCoursierCache`.
 
 #### Lockfile format (`kind = "sbt"`)
 
@@ -393,7 +392,7 @@ The CLI then resolves, per module, the main scope and (main ∪ test) scope sepa
     "sbtVersion": "1.10.7",
     "scalaBootVersion": "2.12.20",
     "launcherJar": { "url": "...", "sha256": "..." },
-    "bootJars": [],
+    "bootFiles": [ { "path": "scala-3.9.0/lib/scala-library.jar", "url": "...", "sha256": "..." } ],
     "bootCoursierCache": [],
     "scalaInstance": [],
     "compilerBridge": []
@@ -414,12 +413,12 @@ Field notes:
 
 Two read-only derivations keyed **only** on `(sbtVersion, scalaBootVersion)` plus the locked sbt-side artifact hashes — nothing project-specific. Two projects on the same sbt + Scala versions share these exact store paths, and changing user source code doesn't invalidate them.
 
-- `sbt-boot-<sbtVersion>-<scalaBootVersion>`: a symlink farm in the launcher's boot layout.
+- `sbt-boot-<sbtVersion>-<scalaBootVersion>`: a symlink farm reproducing the launcher's boot layout verbatim, from the `(path, url, sha256)` triples in `bootFiles`. No filename is derived from a coordinate here — see the pitfalls below for why.
 - `sbt-coursier-<sbtVersion>-<scalaBootVersion>`: `bootCoursierCache` ∪ `scalaInstance` ∪ `compilerBridge` in standard Coursier cache layout.
 
 The project's own dependencies and plugins are layered on top of `COURSIER_CACHE` at build time instead of being merged in here, precisely to keep the toolchain shareable.
 
-`scalaInstance` and `compilerBridge` are unioned over every distinct `scalaVersion` across the build's modules, so a build whose modules disagree on `scalaVersion` still resolves offline.
+`scalaInstance` and `compilerBridge` are unioned over every distinct `scalaVersion` across the build's modules *and* sbt's own `scalaBootVersion` — so a build whose modules disagree on `scalaVersion`, or disagree with sbt's own Scala (always the case on sbt 2, which runs on Scala 3), still resolves offline.
 
 #### Build phase (`buildSbtApp`)
 
@@ -432,18 +431,34 @@ The project's own dependencies and plugins are layered on top of `COURSIER_CACHE
 
 A module's test scope, when it has one, is exposed as `passthru.tests.test` and runs `<id>/test` offline from a writable copy of the project tree. It's picked up by `collectChecks` like any other test.
 
+#### sbt 1 vs sbt 2
+
+Both are supported, and verified against sbt 1.10.7 (`examples/sbt`, `examples/sbt-multi`) and sbt 2.1.0 (the `smellar` project). sbt 2 differs in enough load-bearing ways to be worth listing, because most of them fail in misleading ways:
+
+- **Task keys must be `val`s.** `TaskKey[Unit]("scnManifest") := ...` compiles on sbt 2 and then isn't addressable — `Not a valid key: scnManifest`, as though the file were never read. sbt 2 builds its key index from the build definition's `val` declarations. `val scnManifest = taskKey[Unit](...)` works on both.
+- **Bare statements are illegal** at the top level of an sbt 2 `.sbt` file; a stray `println(...)` is a compile error. Only declarations.
+- **`@transient` on the key is mandatory.** sbt 2 caches task results to disk. Without the annotation the manifest task doesn't even compile — sbt 2 wants an `sjsonnew.HashWriter` for the whole input tuple, and there is none for `ResolvedProject` / `ModuleID` / `VirtualFileRef`. Worse, if one were found, the *second* lock of an unchanged project would be a cache hit: `[success] ... cache 100%, 1 disk cache hit`, no output at all, and we'd fail on the missing sentinels. sbt 2 suggests `@transient` or `Def.uncached`; only the former exists on sbt 1, which ignores it as a plain Scala annotation.
+- **`--server` is required.** For sbt 2 the launcher defaults to the native thin client (`sbtn`), which talks to a persistent background server. A server started *before* we wrote `scn-manifest.sbt` serves its already-loaded build definition, so the task isn't there — the same misleading `Not a valid key`. `--server` forces the in-process JVM sbt, which also means we never attach to or disturb a developer's running sbt session. (This bites sbt 1 users too, any time Metals or BSP has a server up.)
+- **`reload plugins` / `reload return` are gone.** sbt 2 rejects the command line outright ("Expected end of input"), so the meta-build can't be navigated that way. Plugins are instead read from the main build via `Project.extract(state).currentUnit.unit.plugins.pluginData.report`, which works on both and needs no second sbt startup.
+- **Plugin artifact names differ.** sbt 1's update report names a plugin unsuffixed (`com.eed3si9n:sbt-buildinfo:0.13.1`) plus `sbtVersion` / `scalaVersion` marker attributes, and the published artifact is `sbt-buildinfo_2.12_1.0`. sbt 2 reports the suffixed name directly (`sbt-assembly_sbt2_3`) with no markers. Requiring *both* markers to be present is what distinguishes the two cases — and it also excludes artifacts that merely carry other extra attributes, like `scala3-sbt-bridge` with its `info.*` ones.
+- **`packageBin / artifactPath` is an `xsbti.VirtualFileRef`** on sbt 2, not a `File`, and its `toString` is placeholder-based (`${OUT}/jvm/scala-3.9.0/...`). `fileConverter` exists on both and maps either to a real path, so nothing has to know what `${OUT}` expands to. Everything else we read — `baseDirectory`, `unmanagedSources`, `unmanagedResourceDirectories` — is still a `File` on both.
+- **sbt 2's output tree is `target/out/<platform>/scala-<v>/<project>/`**, not `target/scala-<v>/`. Nothing in the build side cares, because the jar path comes from sbt rather than from a glob — which is precisely why it comes from sbt.
+- **sbt's own Scala is a Scala 3** on sbt 2 (`scalaBootVersion` = 3.9.0 for sbt 2.1.0, versus 2.12.x for sbt 1). That is why `scalaBootVersion` joins the modules' Scala versions when resolving `scalaInstance` and the compiler bridge: sbt's `lib/` needs its own compiler stack, whose version need not match anything the project compiles with.
+
 #### Hard-won pitfalls
 
 These cost real time and are worth not rediscovering:
 
-- **The boot directory name is load-bearing.** It must be `scala-<scalaBootVersion>`, not `<scalaBootVersion>`. The launcher accepts *any* directory under the boot dir, then recovers the Scala version by taking the substring after the last `"scala-"` in that directory's name (`BootConfiguration.extractScalaVersion`, with `ScalaVersionPrefix = "scala-"`). A bare `2.12.20` is accepted as a boot dir and then yields no version, which the launcher reports as **sbt#4955** — "sbt launcher is unable to detect the Scala version for org.scala-sbt:sbt; this likely indicates an incomplete artifact resolution and/or corrupt boot cache". The resolution is complete and the cache is fine; the directory is just misnamed.
-- **sbt#4955, for real this time.** It also fires when the launcher's flat boot dir contains *any* evicted-version or duplicate-artifactId jar. Hence the `bootJars` (resolved winners, laid out in the boot dir) / `bootCoursierCache` (full transitive set, for sbt's internal resolution) split.
-- **Scala stdlib filenames in `lib/`.** sbt-launch expects `scala-library.jar`, `scala-compiler.jar`, `scala-reflect.jar` *unversioned* under `<bootDir>/scala-<ver>/lib/` — that's how it names them when self-extracting from its own jar — plus the versioned `scala-xml_2.12-<v>.jar`. We materialize them by filename-mapping the versioned Coursier URLs from `bootJars`.
+- **Don't derive the boot layout from Maven coordinates — ask the launcher.** `lock-sbt` records sbt's boot directory as a list of `(path, url, sha256)` taken from `appConfiguration.value.provider` (`scalaProvider.jars` for `lib/`, `mainClasspath` for the app jars), and recovers each file's origin by matching its *content hash* against the resolved artifacts. The launcher renames files on the way in, so names prove nothing — sbt 1's `lib/scala-library.jar` is Maven's `scala-library-2.12.20.jar`, sbt 2's is `scala-library-3.9.0.jar` — but the bytes are untouched. Reconstructing the layout by hand was wrong twice before this (see the two entries below), and each time the symptom was sbt#4955, which reads as a resolution failure and isn't one.
+- **The boot directory name is load-bearing** — the first way the above went wrong. It must be `scala-<scalaBootVersion>`, not `<scalaBootVersion>`. The launcher accepts *any* directory under the boot root, then recovers the Scala version by taking the substring after the last `"scala-"` in that directory's name (`BootConfiguration.extractScalaVersion`, with `ScalaVersionPrefix = "scala-"`). A bare `2.12.20` is accepted and then yields no version, reported as **sbt#4955**: "sbt launcher is unable to detect the Scala version for org.scala-sbt:sbt; this likely indicates an incomplete artifact resolution and/or corrupt boot cache". Resolution was complete and the cache was fine.
+- **`lib/` filenames differ per sbt generation** — the second way. sbt 1 wants *unversioned* `scala-compiler.jar`, `scala-library.jar` and `scala-reflect.jar` plus a versioned `scala-xml_2.12-<v>.jar`; sbt 2 wants versioned Scala 3 names (`scala3-compiler_3-<v>.jar`, `scala3-library_3-<v>.jar`, `scala3-interfaces-<v>.jar`, `tasty-core_3-<v>.jar`, `scala-asm-<v>.jar`) plus an unversioned `scala-library.jar`. Hence: ask the launcher.
+- **sbt#4955 for the reason it actually documents.** It also fires when the boot directory contains *any* evicted-version or duplicate-artifactId jar. That's why `bootFiles` holds only what the launcher itself keeps, while `bootCoursierCache` carries the full transitive set (with POMs and evicted versions) for sbt's own resolution.
 - **`pkgs.sbt` is the wrong launcher for the sandbox.** It's bundled with one specific Scala bootstrap version and will try to fetch a different one over the network whenever `project/build.properties` points elsewhere. We lock and exec the matching `sbt-launch-<sbtVersion>.jar` directly. `pkgs.sbt` is fine at *lock* time, where there's a network.
 - **`-Dsbt.offline=true` matters.** Without it lm-coursier still reaches for the network at update time and chokes on the HTML error page with the baffling `SAXParseException: DOCTYPE is disallowed`. The real error underneath is `UnknownHostException`.
 - **`sbt update` resolves all configurations at once.** It's per-project, but asking for `app/package` still resolves `app`'s Test configuration. So the *build* cache needs each closure module's test dependencies too, even though nothing there compiles tests (`sbtModuleAllDeps`). The runtime *classpath*, by contrast, takes only the main scope — munit has no business on an app's classpath.
 - **`mkCacheDir` with an empty list produces no `$out`.** It emits one `mkdir`+`ln` per artifact, so an empty dependency list yields an empty builder and the derivation fails. Projects without plugins get no plugin cache layered in at all, rather than an empty one.
 - **Batch mode and colors come from JVM flags, not CLI flags.** `-no-colors` / `-batch` are understood by the `sbt` shell script, not by `sbt-launch.jar`. The equivalents are `-Dsbt.color=false`, `-Dsbt.supershell=false`, and closing stdin (`< /dev/null`).
+- **sbt logs errors to stdout.** `lock-sbt` captures stdout (that's where the manifest comes from) and only forwards stderr, so a failure replays the captured stdout into the exception. Without that, a broken build definition shows up as a bare "sbt exited with code 1".
 - **Inherited dependency versions** (shared with the scala-cli path). Many POMs declare `<dependency>` blocks with no `<version>`, inheriting it from an ancestor's `<dependencyManagement>`. `collectAccumulatedDependencyManagement` walks the parent chain building a `(g,a) → v` map and `collectDeclaredPoms` fills in the gaps. Needed to pick up `jackson-annotations:2.12.1.pom` for sbt's lm-coursier on Linux.
 
 #### Known limitations
